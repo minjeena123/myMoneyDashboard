@@ -6,9 +6,9 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="12월 잔금 현금화 대시보드", page_icon="📊", layout="wide")
-st.title("📊 12월 잔금용 투자 현금화 대시보드")
-st.caption("보유 종목별 가격 추세와 잔금 기한을 분석해 매도/일부 매도/유지/판단 보류를 제안합니다. 자동 주문은 실행하지 않습니다.")
+st.set_page_config(page_title="투자 판단 대시보드", page_icon="📊", layout="wide")
+st.title("📊 투자 판단 대시보드")
+st.caption("목표일 기반 현금화 모드와 목표일 없는 장기 투자 모드를 비교합니다. 자동 주문은 실행하지 않습니다.")
 
 BASE = "https://api.nhplug.com:8443"
 TOKEN_URL = BASE + "/oauth2/token"
@@ -188,7 +188,7 @@ def market_stats(ticker):
     except Exception:
         return None
 
-def recommendation(row, stats, days, shortfall, total):
+def recommendation(row, stats, days, shortfall, total, mode="목표일 있음"):
     val = num(row["평가금액(원)"])
     ticker = str(row["시장 티커"]).strip().upper()
     weight = val / total * 100 if total > 0 else 0
@@ -208,7 +208,22 @@ def recommendation(row, stats, days, shortfall, total):
     if drawdown: signals.append("3개월 고점 대비 15% 이상 하락")
     if weight >= 25: signals.append("포트폴리오 비중 25% 이상")
     if not signals: signals = ["위험 신호 기준 미충족"]
-    if days <= 14:
+    if mode == "목표일 없음":
+        # 장기 투자 모드: 달력에 따른 강제 매도가 아니라 추세/위험 신호를 중심으로 판단
+        risk_count = int(bearish) + int(weak) + int(volatile) + int(drawdown) + int(weight >= 25)
+        if risk_count >= 3:
+            action, pct = "위험 축소 검토", 40
+            why = "목표일이 없으므로 일정에 따른 매도는 적용하지 않습니다. 여러 위험 신호가 겹쳐 일부 비중 축소를 검토합니다."
+        elif risk_count == 2:
+            action, pct = "일부 매도 검토", 20
+            why = "목표일이 없으므로 일정에 따른 매도는 적용하지 않습니다. 위험 신호 2개가 확인되어 리밸런싱을 검토합니다."
+        elif risk_count == 1:
+            action, pct = "관찰 / 보유 검토", 0
+            why = "위험 신호가 제한적입니다. 단일 지표만으로 매도하지 말고 추세를 관찰하세요."
+        else:
+            action, pct = "보유 검토", 0
+            why = "현재 설정한 위험 신호 기준이 충족되지 않았습니다. 정기적으로 포트폴리오 비중과 지표를 점검하세요."
+    elif days <= 14:
         action, pct = "매도 우선 검토", 100
         why = "목표일까지 2주 이하입니다. 잔금에 필요한 자금이라면 반등을 기다리기보다 현금 확보를 우선 검토하세요."
     elif days <= 45:
@@ -226,21 +241,32 @@ def recommendation(row, stats, days, shortfall, total):
     if volatile: risk.append("높은 변동성")
     if drawdown: risk.append("고점 대비 큰 하락")
     if weight >= 25: risk.append("종목 집중")
-    if risk and days > 14:
+    if risk and mode == "목표일 있음" and days > 14:
         if action == "유지 또는 분할 매도": action, pct = "일부 매도", 40
         elif action == "일부 매도": pct = min(pct + 15, 75)
         elif action == "매도": pct = min(pct + 10, 90)
         why += " 추가 위험 요인: " + ", ".join(risk) + "."
-    why += f" 미확보 현금 입력값: {krw(shortfall)}."
+    elif risk and mode == "목표일 없음":
+        why += " 확인된 위험 신호: " + ", ".join(risk) + "."
+    if mode == "목표일 있음":
+        why += f" 미확보 현금 입력값: {krw(shortfall)}."
     return action, pct, why, "; ".join(signals)
 
 # 목표액은 사용자가 직접 입력: 추정치로 임의 계산하지 않음
-st.sidebar.header("현금화 계획")
-target_date = st.sidebar.date_input("잔금/현금화 목표일", value=date(2026, 12, 18))
-target_cash = st.sidebar.number_input("주식에서 확보해야 할 현금 목표액 (원)", min_value=0, value=0, step=1_000_000)
-secured_cash = st.sidebar.number_input("이미 확보한 현금 (원)", min_value=0, value=0, step=1_000_000)
-days_left = (target_date - date.today()).days
-shortfall = max(target_cash - secured_cash, 0)
+st.sidebar.header("판단 모드")
+mode = st.sidebar.radio("투자 판단 기준", ["목표일 있음", "목표일 없음"], help="목표일 있음: 잔금 현금 확보 일정 중심 / 목표일 없음: 추세와 위험 신호 중심")
+if mode == "목표일 있음":
+    target_date = st.sidebar.date_input("잔금/현금화 목표일", value=date(2026, 12, 18))
+    target_cash = st.sidebar.number_input("주식에서 확보해야 할 현금 목표액 (원)", min_value=0, value=0, step=1_000_000)
+    secured_cash = st.sidebar.number_input("이미 확보한 현금 (원)", min_value=0, value=0, step=1_000_000)
+    days_left = (target_date - date.today()).days
+    shortfall = max(target_cash - secured_cash, 0)
+else:
+    target_date = None
+    target_cash = 0
+    secured_cash = 0
+    days_left = 999999  # 일정 기반 매도 규칙은 recommendation의 장기 모드 분기에서 사용하지 않음
+    shortfall = 0
 
 st.subheader("1. 보유 자산 불러오기")
 c1, c2 = st.columns([1, 2])
@@ -344,7 +370,7 @@ results = []
 for _, row in edited.iterrows():
     ticker = str(row["시장 티커"]).strip().upper()
     s = stats.get(ticker) if ticker else None
-    action, pct, why, signal = recommendation(row, s, days_left, shortfall, total)
+    action, pct, why, signal = recommendation(row, s, days_left, shortfall, total, mode)
     out = row.to_dict()
     out.update({"판단": action, "제안 매도 비율(%)": pct, "판단 근거": why, "시장 신호": signal})
     if s:
@@ -355,7 +381,7 @@ for _, row in edited.iterrows():
     results.append(out)
 
 rec = pd.DataFrame(results)
-order = {"매도 우선 검토": 0, "매도": 1, "일부 매도": 2, "유지 또는 분할 매도": 3, "판단 보류": 4}
+order = {"매도 우선 검토": 0, "매도": 1, "위험 축소 검토": 2, "일부 매도 검토": 3, "일부 매도": 4, "관찰 / 보유 검토": 5, "유지 또는 분할 매도": 6, "보유 검토": 7, "판단 보류": 8}
 rec["_order"] = rec["판단"].map(order).fillna(5)
 rec["비중(%)"] = rec["평가금액(원)"].apply(lambda x: num(x) / total * 100 if total > 0 else 0)
 rec = rec.sort_values(["_order", "제안 매도 비율(%)", "평가금액(원)"], ascending=[True, False, False]).drop(columns="_order")
@@ -363,12 +389,18 @@ rec = rec.sort_values(["_order", "제안 매도 비율(%)", "평가금액(원)"]
 st.subheader("4. 오늘의 매도 판단")
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("주식 평가금액", krw(total))
-m2.metric("목표일까지", f"{days_left}일")
-m3.metric("현금 목표", krw(target_cash))
-m4.metric("미확보 현금", krw(shortfall))
-if days_left <= 45:
-    st.warning("잔금일까지 45일 이하입니다. 잔금에 필요한 돈은 주식 변동성에 노출되지 않도록 실제 현금화 일정을 확인하세요.")
-st.caption("규칙은 기한, 20/50일 이동평균, 최근 20거래일 수익률, 변동성, 고점 대비 하락, 종목 집중도를 사용합니다. 예측이나 수익 보장은 아닙니다.")
+if mode == "목표일 있음":
+    m2.metric("목표일까지", f"{days_left}일")
+    m3.metric("현금 목표", krw(target_cash))
+    m4.metric("미확보 현금", krw(shortfall))
+    if days_left <= 45:
+        st.warning("잔금일까지 45일 이하입니다. 잔금에 필요한 돈은 주식 변동성에 노출되지 않도록 실제 현금화 일정을 확인하세요.")
+else:
+    m2.metric("판단 기준", "시장 위험")
+    m3.metric("목표일", "없음")
+    m4.metric("위험 신호", "다중 지표")
+    st.info("목표일 없음 모드: 일정에 따른 강제 매도는 적용하지 않습니다. 여러 위험 신호가 겹칠 때만 비중 축소를 검토합니다.")
+st.caption("규칙은 선택한 모드에 따라 기한 또는 20/50일 이동평균, 최근 20거래일 수익률, 변동성, 고점 대비 하락, 종목 집중도를 참고합니다. 예측이나 수익 보장은 아닙니다.")
 
 display_cols = ["판단", "종목명", "시장 티커", "평가금액(원)", "비중(%)", "제안 매도 비율(%)",
                 "판단 근거", "시장 신호", "20거래일 변화(%)", "연환산 변동성(%)", "3개월 고점 대비(%)", "데이터 일자"]
