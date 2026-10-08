@@ -188,6 +188,64 @@ def market_stats(ticker):
     except Exception:
         return None
 
+def expert_perspectives(row, stats, total, mode):
+    """공개된 투자 원칙을 설명용 관점으로 적용한다. 특정 전문가의 실시간 종목 추천은 아니다."""
+    val = num(row.get("평가금액(원)"))
+    weight = val / total * 100 if total > 0 else 0
+    if not stats:
+        return [
+            ("하워드 막스 · 위험 관리", "가격 데이터가 없어 위험 신호를 평가하기 어렵습니다. 데이터 확인 전에는 강한 보유/매도 판단을 피하세요."),
+            ("존 머피 · 추세 분석", "티커 또는 가격 데이터가 확인되면 이동평균과 모멘텀을 기준으로 추세를 평가합니다."),
+            ("CFA · 목표·유동성", "시장 신호를 해석하기 전에 잔금 일정, 필요한 현금, 세금과 유동성 제약을 먼저 확인하세요.")
+        ]
+
+    close = num(stats.get("최근 종가"))
+    sma20 = num(stats.get("SMA20"))
+    sma50 = num(stats.get("SMA50")) if stats.get("SMA50") is not None else None
+    ret20 = stats.get("20거래일 변화(%)")
+    vol = stats.get("연환산 변동성(%)")
+    dd = stats.get("3개월 고점 대비(%)")
+    risks = []
+    if close < sma20:
+        risks.append("종가가 20일 평균선 아래")
+    if sma50 is not None and close < sma50:
+        risks.append("종가가 50일 평균선 아래")
+    if ret20 is not None and ret20 <= -8:
+        risks.append("최근 20거래일 약세")
+    if vol is not None and vol >= 45:
+        risks.append("높은 변동성")
+    if dd is not None and dd <= -15:
+        risks.append("3개월 고점 대비 큰 하락")
+    if weight >= 25:
+        risks.append("포트폴리오 내 비중 집중")
+
+    trend = "20일 평균선 위" if close >= sma20 else "20일 평균선 아래"
+    if sma50 is not None:
+        trend += ", 50일 평균선 위" if close >= sma50 else ", 50일 평균선 아래"
+    if ret20 is not None:
+        trend += f", 최근 20거래일 {ret20:+.1f}%"
+    trend_text = f"현재 기술적 상태는 {trend}입니다. "
+    if close < sma20 and sma50 is not None and close < sma50:
+        trend_text += "단기·중기 추세가 모두 약한 편이므로 반등만을 전제로 보유 판단을 내리지 말고 추가 확인이 필요합니다."
+    elif close < sma20:
+        trend_text += "단기 약세 신호입니다. 중기 추세와 거래량 등 추가 근거를 함께 확인하세요."
+    else:
+        trend_text += "이동평균 기준으로는 단기 추세가 유지되고 있지만, 이것만으로 추가 상승을 보장하지는 않습니다."
+
+    risk_text = "확인된 위험 요인: " + ", ".join(risks) + "." if risks else "설정한 주요 위험 신호가 뚜렷하게 겹치지는 않습니다. 다만 신호 부재가 안전이나 저평가를 의미하지는 않습니다."
+    risk_text += f" 현재 포트폴리오 비중은 {weight:.1f}%입니다."
+
+    if mode == "목표일 있음":
+        liquidity_text = "목표일 기반 판단에서는 시장 전망보다 잔금에 필요한 현금 확보 가능성이 우선입니다. 필요한 현금에 해당하는 물량은 가격 반등을 기다리기보다 결제일·세금·환전 시간을 감안해 별도로 관리하세요."
+    else:
+        liquidity_text = "목표일이 없는 경우에는 날짜만으로 매도하지 않습니다. 투자 근거, 분산 상태와 위험 허용도를 점검하고, 비중이 과도하거나 여러 위험 신호가 겹칠 때만 리밸런싱을 검토하세요."
+
+    return [
+        ("하워드 막스 · 위험 관리 관점", risk_text + " 이는 위험 신호를 정리한 참고 해석이며, 하워드 막스의 해당 종목에 대한 실제 발언이나 추천은 아닙니다."),
+        ("존 머피 · 기술적 분석 관점", trend_text),
+        ("CFA · 목표·유동성 관점", liquidity_text)
+    ]
+
 def recommendation(row, stats, days, shortfall, total, mode="목표일 있음"):
     val = num(row["평가금액(원)"])
     ticker = str(row["시장 티커"]).strip().upper()
@@ -401,6 +459,7 @@ else:
     m4.metric("위험 신호", "다중 지표")
     st.info("목표일 없음 모드: 일정에 따른 강제 매도는 적용하지 않습니다. 여러 위험 신호가 겹칠 때만 비중 축소를 검토합니다.")
 st.caption("규칙은 선택한 모드에 따라 기한 또는 20/50일 이동평균, 최근 20거래일 수익률, 변동성, 고점 대비 하락, 종목 집중도를 참고합니다. 예측이나 수익 보장은 아닙니다.")
+st.markdown("**전문가 원칙 참고 자료** · [Oaktree / Howard Marks 투자 메모](https://www.oaktreecapital.com/insights) · [CFA Institute: 자산배분 개요](https://www.cfainstitute.org/insights/professional-learning/refresher-readings/2026/overview-asset-allocation) · [CFA Institute: 현실적 제약을 반영한 자산배분](https://www.cfainstitute.org/insights/professional-learning/refresher-readings/2026/asset-allocation-with-real-world-constraints)")
 
 display_cols = ["판단", "종목명", "시장 티커", "평가금액(원)", "비중(%)", "제안 매도 비율(%)",
                 "판단 근거", "시장 신호", "20거래일 변화(%)", "연환산 변동성(%)", "3개월 고점 대비(%)", "데이터 일자"]
@@ -425,6 +484,12 @@ for _, row in rec.iterrows():
             st.write(f"최근 종가: {row['최근 종가']:.2f} · 20일 평균: {row['SMA20']:.2f}")
             if pd.notna(row.get("SMA50")):
                 st.write(f"50일 평균: {row['SMA50']:.2f}")
+        st.markdown("**전문가 원칙 기반 참고 의견**")
+        st.caption("아래는 투자 서적·전문 자료의 원칙을 현재 지표에 적용한 해석입니다. 전문가가 이 종목을 직접 평가한 실시간 의견이나 매수·매도 추천이 아닙니다.")
+        for perspective_title, perspective_text in expert_perspectives(row, stats.get(str(row.get("시장 티커", "")).strip().upper()), total, mode):
+            st.markdown(f"**{perspective_title}**")
+            st.write(perspective_text)
+        st.caption("참고 자료: Howard Marks/Oaktree 투자 메모 · John J. Murphy의 기술적 분석 체계 · CFA Institute의 자산배분 및 현실적 제약 자료")
         st.caption("제안은 규칙 기반 참고 정보입니다. 매도 전 세금, 환율, 수수료, 결제일과 잔금 필요액을 확인하세요.")
 
 st.download_button("📥 매도 판단 CSV 다운로드",
