@@ -341,7 +341,25 @@ if st.button("나무 계좌 잔고 불러오기"):
             else:
                 st.info("조회된 해외주식 보유 종목이 없어.")
     except Exception:
-        st.error(
-            "잔고 조회에 실패했어. Secrets, 계좌번호 형식, "
-            "API 신청 권한과 요청 명세를 확인해 줘."
-        )
+            except requests.exceptions.HTTPError as e:
+        st.error("API가 HTTP 오류를 반환했어.")
+        r = e.response
+
+        if r is not None:
+            st.write("HTTP 상태 코드:", r.status_code)
+
+            try:
+                data = r.json()
+                st.write("응답 코드:", data.get("rsp_cd", data.get("error", "미제공")))
+                st.write("응답 메시지:", data.get("rsp_msg", data.get("error_description", "미제공")))
+            except ValueError:
+                st.write("응답 본문을 JSON으로 읽지 못했어.")
+
+    except requests.exceptions.RequestException as e:
+        st.error("네트워크 요청에 실패했어.")
+        st.write("오류 종류:", type(e).__name__)
+
+    except Exception as e:
+        st.error("API 조회 중 오류가 발생했어.")
+        st.write("오류 종류:", type(e).__name__)
+        st.write("오류 메시지:", str(e))
