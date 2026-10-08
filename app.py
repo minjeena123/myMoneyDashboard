@@ -1,365 +1,319 @@
+import time
+from datetime import date, datetime
 
-import streamlit as st
 import pandas as pd
-import numpy as np
-import yfinance as yf
-from datetime import date
 import requests
 import streamlit as st
+import yfinance as yf
 
-if st.button("나무 PLUG 연결 테스트"):
+st.set_page_config(page_title="12월 잔금 현금화 대시보드", page_icon="📊", layout="wide")
+st.title("📊 12월 잔금용 투자 현금화 대시보드")
+st.caption("보유 종목별 가격 추세와 잔금 기한을 분석해 매도/일부 매도/유지/판단 보류를 제안합니다. 자동 주문은 실행하지 않습니다.")
+
+BASE = "https://api.nhplug.com:8443"
+TOKEN_URL = BASE + "/oauth2/token"
+BALANCE_URL = BASE + "/gbstock/inquiry/v1/balance"
+COLS = ["종목명", "종목코드", "시장 티커", "평가금액(원)", "손익금액(원)", "수익률(%)", "보유수량", "증권사"]
+
+def num(x, default=0.0):
     try:
-        response = requests.post(
-            "https://api.nhplug.com:8443/oauth2/token",
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
-            data={
-                "appkey": st.secrets["NHPLUG_APP_KEY"],
-                "appsecretkey": st.secrets["NHPLUG_APP_SECRET"],
-                "grant_type": "client_credentials",
-                "scope": "oob",
-            },
-            timeout=20,
-        )
+        return float(str(x).replace(",", "").replace("%", "").strip()) if x not in (None, "") else default
+    except (ValueError, TypeError):
+        return default
 
-        if response.ok and response.json().get("access_token"):
-            st.success("인증 성공! 나무 PLUG에 연결할 준비가 됐어.")
-        else:
-            st.error(
-                f"인증 실패: HTTP {response.status_code}. "
-                "API 신청 상태와 Secrets 설정을 확인해 줘."
-            )
+def krw(x):
+    return f"₩{num(x):,.0f}"
+
+def secrets_values():
+    needed = ["NHPLUG_APP_KEY", "NHPLUG_APP_SECRET", "NHPLUG_ACCOUNT_NO"]
+    missing = [k for k in needed if k not in st.secrets]
+    if missing:
+        raise ValueError("Streamlit Secrets 누락: " + ", ".join(missing))
+    key, secret, acct = [str(st.secrets[k]).strip() for k in needed]
+    if not acct.isdigit() or len(acct) != 11:
+        raise ValueError("NHPLUG_ACCOUNT_NO는 숫자 11자리인지 확인하세요.")
+    return key, secret, acct
+
+def token():
+    now = time.time()
+    cached = st.session_state.get("nh_token")
+    if cached and now < st.session_state.get("nh_token_expiry", 0):
+        return cached
+    key, secret, _ = secrets_values()
+    r = requests.post(TOKEN_URL,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={"appkey": key, "appsecretkey": secret, "grant_type": "client_credentials", "scope": "oob"},
+        timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"토큰 발급 HTTP 오류: {r.status_code}")
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError("토큰 응답이 JSON 형식이 아닙니다.")
+    tok = data.get("access_token")
+    if not tok:
+        raise RuntimeError(f"토큰 발급 실패: {data.get('error', '코드 없음')} / {data.get('error_description', data.get('rsp_msg', '메시지 없음'))}")
+    st.session_state["nh_token"] = tok
+    st.session_state["nh_token_expiry"] = now + max(num(data.get("expires_in"), 86400) - 120, 60)
+    return tok
+
+def nh_balance():
+    key, secret, acct = secrets_values()
+    r = requests.post(BALANCE_URL,
+        headers={"Content-Type": "application/json; charset=UTF-8", "Authorization": f"Bearer {token()}",
+                 "x-client-id": key, "x-client-secret": secret},
+        json={"Input_0": {"act_no": acct, "qut_iqr_dit_cd": "9", "fc_sec_trd_nat_cd": "200", "cur_cd": "KRW", "xns_dit_cd": "0"}},
+        timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"잔고 조회 HTTP 오류: {r.status_code}")
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError("잔고 응답이 JSON 형식이 아닙니다.")
+    if "Output_0" not in data and "Output_1" not in data:
+        raise RuntimeError(f"API 응답 오류: {data.get('rsp_cd', '코드 없음')} / {data.get('rsp_msg', '메시지 없음')}")
+    rows = data.get("Output_1", [])
+    if isinstance(rows, dict):
+        rows = [rows]
+    return data.get("Output_0", {}), rows if isinstance(rows, list) else []
+
+def from_api(rows, broker):
+    out = []
+    for x in rows:
+        out.append({"종목명": x.get("iem_nm", "이름 없음"), "종목코드": x.get("iem_cd", ""),
+                    "시장 티커": "", "평가금액(원)": num(x.get("krw_eal_amt")),
+                    "손익금액(원)": num(x.get("krw_eal_pls_amt")), "수익률(%)": num(x.get("eal_pft_rt1")),
+                    "보유수량": num(x.get("cns_bse_bnc_qty")), "증권사": broker})
+    return pd.DataFrame(out, columns=COLS)
+
+def read_csv(upload):
+    if upload is None:
+        return pd.DataFrame(columns=COLS)
+    df = pd.read_csv(upload, encoding="utf-8-sig")
+    df.columns = [str(c).strip() for c in df.columns]
+    if "종목명" not in df or "평가금액(원)" not in df:
+        raise ValueError("CSV 필수 열은 종목명, 평가금액(원)입니다.")
+    defaults = {"종목코드": "", "시장 티커": "", "손익금액(원)": 0, "수익률(%)": 0, "보유수량": 0, "증권사": "기타 증권사"}
+    for c, v in defaults.items():
+        if c not in df:
+            df[c] = v
+    df = df[COLS].copy()
+    for c in ["평가금액(원)", "손익금액(원)", "수익률(%)", "보유수량"]:
+        df[c] = df[c].apply(num)
+    df["시장 티커"] = df["시장 티커"].fillna("").astype(str).str.strip().str.upper()
+    return df
+
+def market_stats(ticker):
+    try:
+        h = yf.Ticker(ticker).history(period="6mo", interval="1d", auto_adjust=True)
+        close = h["Close"].dropna()
+        if len(close) < 20:
+            return None
+        last = float(close.iloc[-1])
+        sma20 = float(close.rolling(20).mean().iloc[-1])
+        sma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None
+        prev = float(close.iloc[-21]) if len(close) >= 21 else None
+        ret20 = (last / prev - 1) * 100 if prev else None
+        returns = close.pct_change().dropna()
+        vol = float(returns.tail(20).std() * (252 ** 0.5) * 100) if len(returns) >= 10 else None
+        high = float(close.tail(63).max())
+        dd = (last / high - 1) * 100 if high else None
+        return {"최근 종가": last, "SMA20": sma20, "SMA50": sma50, "20거래일 변화(%)": ret20,
+                "연환산 변동성(%)": vol, "3개월 고점 대비(%)": dd, "데이터 일자": str(close.index[-1].date())}
     except Exception:
-        st.error("연결에 실패했어. Secrets와 네트워크 설정을 확인해 줘.")
-st.set_page_config(
-    page_title="My Market Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+        return None
 
-st.markdown("""
-<style>
-.block-container {padding: 1rem 1rem 2rem 1rem; max-width: 1200px;}
-h1 {font-size: 1.7rem !important;}
-[data-testid="stMetricValue"] {font-size: 1.35rem;}
-div[data-testid="stMetric"] {padding: .45rem .2rem;}
-.small {font-size:.85rem; color:#666;}
-.card {padding:1rem; border:1px solid #ddd; border-radius:14px; margin:.4rem 0;}
-</style>
-""", unsafe_allow_html=True)
+def recommendation(row, stats, days, shortfall, total):
+    val = num(row["평가금액(원)"])
+    ticker = str(row["시장 티커"]).strip().upper()
+    weight = val / total * 100 if total > 0 else 0
+    if val <= 0:
+        return "판단 보류", 0, "평가금액이 0 이하입니다.", "데이터 확인 필요"
+    if not ticker or stats is None:
+        return "판단 보류", 0, "시장 티커/가격 데이터를 확인할 수 없습니다. 티커를 입력하고 다시 분석하세요.", "시장 데이터 없음"
+    bearish = stats["최근 종가"] < stats["SMA20"] and stats["SMA50"] is not None and stats["최근 종가"] < stats["SMA50"]
+    weak = stats["20거래일 변화(%)"] is not None and stats["20거래일 변화(%)"] <= -8
+    volatile = stats["연환산 변동성(%)"] is not None and stats["연환산 변동성(%)"] >= 45
+    drawdown = stats["3개월 고점 대비(%)"] is not None and stats["3개월 고점 대비(%)"] <= -15
+    signals = []
+    if bearish: signals.append("종가가 20일·50일 평균선 아래")
+    elif stats["최근 종가"] < stats["SMA20"]: signals.append("종가가 20일 평균선 아래")
+    if weak: signals.append("20거래일 하락률 8% 이상")
+    if volatile: signals.append("연환산 변동성 45% 이상")
+    if drawdown: signals.append("3개월 고점 대비 15% 이상 하락")
+    if weight >= 25: signals.append("포트폴리오 비중 25% 이상")
+    if not signals: signals = ["위험 신호 기준 미충족"]
+    if days <= 14:
+        action, pct = "매도 우선 검토", 100
+        why = "목표일까지 2주 이하입니다. 잔금에 필요한 자금이라면 반등을 기다리기보다 현금 확보를 우선 검토하세요."
+    elif days <= 45:
+        action, pct = "매도", 75
+        why = "목표일까지 45일 이하이므로 단기 변동 위험을 낮추기 위해 현금화를 우선 검토합니다."
+    elif days <= 90:
+        action, pct = "일부 매도", 50
+        why = "목표일까지 90일 이하입니다. 단계적으로 현금 비중을 높이는 방안을 검토합니다."
+    else:
+        action, pct = "유지 또는 분할 매도", 25
+        why = "목표일까지 시간이 남아 있습니다. 계획에 따라 분할 현금화를 검토합니다."
+    risk = []
+    if bearish: risk.append("추세 약세")
+    if weak: risk.append("최근 모멘텀 약세")
+    if volatile: risk.append("높은 변동성")
+    if drawdown: risk.append("고점 대비 큰 하락")
+    if weight >= 25: risk.append("종목 집중")
+    if risk and days > 14:
+        if action == "유지 또는 분할 매도": action, pct = "일부 매도", 40
+        elif action == "일부 매도": pct = min(pct + 15, 75)
+        elif action == "매도": pct = min(pct + 10, 90)
+        why += " 추가 위험 요인: " + ", ".join(risk) + "."
+    why += f" 미확보 현금 입력값: {krw(shortfall)}."
+    return action, pct, why, "; ".join(signals)
 
-st.title("📊 My Market Risk Dashboard")
-st.caption("시장 위험도 + 포트폴리오 + 12월 현금화 계획")
+# 목표액은 사용자가 직접 입력: 추정치로 임의 계산하지 않음
+st.sidebar.header("현금화 계획")
+target_date = st.sidebar.date_input("잔금/현금화 목표일", value=date(2026, 12, 18))
+target_cash = st.sidebar.number_input("주식에서 확보해야 할 현금 목표액 (원)", min_value=0, value=0, step=1_000_000)
+secured_cash = st.sidebar.number_input("이미 확보한 현금 (원)", min_value=0, value=0, step=1_000_000)
+days_left = (target_date - date.today()).days
+shortfall = max(target_cash - secured_cash, 0)
 
-DEFAULT = pd.DataFrame([
-    ["QQQM", 38.7, 358197],
-    ["NVDA", 15.839, 281841],
-    ["AMD", 4.44, 495608],
-    ["TSLA", 6.6374, 525203],
-    ["GOOGL", 6.98, 442589],
-    ["PLTR", 10.81, 238839],
-    ["MSFT", 2.905, 687581],
-], columns=["Ticker","Shares","Avg KRW"])
-
-@st.cache_data(ttl=900)
-def get_data(tickers):
-    out = {}
-    for t in tickers:
+st.subheader("1. 보유 자산 불러오기")
+c1, c2 = st.columns([1, 2])
+with c1:
+    if st.button("🔄 나무증권 미국 주식 잔고 조회", type="primary", use_container_width=True):
         try:
-            hist = yf.download(t, period="1y", auto_adjust=True, progress=False)
-            if hist.empty: continue
-            if isinstance(hist.columns, pd.MultiIndex):
-                close = hist["Close"][t]
-            else:
-                close = hist["Close"]
-            close = close.dropna()
-            if len(close) < 30: continue
-            price = float(close.iloc[-1])
-            ma50 = float(close.rolling(50).mean().iloc[-1])
-            ma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else np.nan
-            high = float(close.max())
-            rsi_delta = close.diff()
-            gain = rsi_delta.clip(lower=0).rolling(14).mean()
-            loss = (-rsi_delta.clip(upper=0)).rolling(14).mean()
-            rs = gain / loss.replace(0, np.nan)
-            rsi = float((100 - 100/(1+rs)).iloc[-1])
-            out[t] = dict(price=price, ma50=ma50, ma200=ma200, high=high, rsi=rsi)
-        except Exception:
-            pass
-    return out
+            with st.spinner("잔고 조회 중..."):
+                summary, items = nh_balance()
+            st.session_state["nh_df"] = from_api(items, "나무증권")
+            st.session_state["nh_summary"] = summary
+            st.session_state["nh_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.success(f"{len(items)}개 종목을 불러왔습니다.")
+        except requests.exceptions.Timeout:
+            st.error("API 요청 시간이 초과되었습니다. 잠시 후 다시 시도하세요.")
+        except requests.exceptions.RequestException as exc:
+            st.error(f"네트워크 오류: {type(exc).__name__}")
+        except Exception as exc:
+            st.error(f"잔고 조회 실패: {type(exc).__name__}")
+            st.code(str(exc))
+with c2:
+    st.caption("티커는 증권사 종목코드와 다를 수 있어 자동 추정하지 않습니다. 잔고 조회 후 티커를 직접 연결해 주세요.")
 
-# Sidebar
-with st.sidebar:
-    st.header("⚙️ 현금화 설정")
-    target = st.number_input("12월까지 필요한 현금 (원)", min_value=0, value=100_000_000, step=5_000_000)
-    cash = st.number_input("현재 현금 (원)", min_value=0, value=0, step=5_000_000)
-    loan = st.number_input("확정 대출/유입자금 (원)", min_value=0, value=0, step=5_000_000)
-    emergency = st.number_input("남겨둘 비상금 (원)", min_value=0, value=10_000_000, step=1_000_000)
-    buffer = st.number_input("세금/거래비용 버퍼 (원)", min_value=0, value=3_000_000, step=500_000)
-    st.divider()
-    st.caption("※ 실제 투자 판단 전 세금·대출·자금계획은 별도로 확인하세요.")
+if st.session_state.get("nh_time"):
+    st.caption("나무증권 마지막 조회: " + st.session_state["nh_time"])
 
-st.subheader("🌐 Market")
+st.markdown("**다른 증권사 CSV 업로드**")
+st.caption("필수 열: 종목명, 평가금액(원). 시장 분석을 위해 시장 티커 열도 입력하세요. 예: QQQM, NVDA, AAPL.")
+upload = st.file_uploader("보유 종목 CSV", type=["csv"])
+other = pd.DataFrame(columns=COLS)
+if upload:
+    try:
+        other = read_csv(upload)
+        st.success(f"CSV {len(other)}개 종목을 읽었습니다.")
+    except Exception as exc:
+        st.error(f"CSV 처리 실패: {exc}")
 
-market_tickers = ["^GSPC","^NDX","^VIX","^TNX","DX-Y.NYB","KRW=X","BTC-USD"]
-data = get_data(market_tickers)
+nh = st.session_state.get("nh_df", pd.DataFrame(columns=COLS))
+sources = [d for d in [nh, other] if d is not None and not d.empty]
+portfolio = pd.concat(sources, ignore_index=True) if sources else pd.DataFrame(columns=COLS)
+if portfolio.empty:
+    st.info("잔고를 조회하거나 다른 증권사 CSV를 업로드해 주세요.")
+    st.stop()
 
-cols = st.columns(4)
-labels = [("^GSPC","S&P 500"),("^NDX","NASDAQ 100"),("^VIX","VIX"),("^TNX","US 10Y")]
-for c,(t,l) in zip(cols, labels):
-    if t in data:
-        c.metric(l, f"{data[t]['price']:,.2f}")
-    else:
-        c.metric(l, "N/A")
-
-cols = st.columns(3)
-for c,(t,l) in zip(cols, [("DX-Y.NYB","DXY"),("KRW=X","USD/KRW"),("BTC-USD","BTC")]):
-    if t in data:
-        p=data[t]["price"]
-        c.metric(l, f"{p:,.2f}" if t!="BTC-USD" else f"${p:,.0f}")
-    else:
-        c.metric(l,"N/A")
-
-# Risk score
-def risk_score(d):
-    score=50
-    reasons=[]
-    if "^VIX" in d:
-        v=d["^VIX"]["price"]
-        if v<15: score-=10
-        elif v<20: score-=3
-        elif v<25: score+=8; reasons.append("VIX 20 이상")
-        elif v<30: score+=18; reasons.append("VIX 25 이상")
-        else: score+=28; reasons.append("VIX 30 이상")
-    for t,name in [("^GSPC","S&P 500"),("^NDX","NASDAQ")]:
-        if t in d and not np.isnan(d[t]["ma200"]):
-            if d[t]["price"] < d[t]["ma200"]:
-                score += 12; reasons.append(f"{name} 200DMA 하회")
-            else:
-                score -= 4
-    if "^TNX" in d:
-        y=d["^TNX"]["price"]
-        if y>5.5: score+=18; reasons.append("US10Y 5.5% 이상")
-        elif y>5.2: score+=12; reasons.append("US10Y 5.2% 이상")
-        elif y>5.0: score+=6; reasons.append("US10Y 5.0% 이상")
-    if "DX-Y.NYB" in d and d["DX-Y.NYB"]["price"]>105:
-        score+=5; reasons.append("DXY 상승 부담")
-    score=int(max(0,min(100,score)))
-    regime="🟢 RISK ON" if score<40 else ("🟡 CAUTION" if score<60 else ("🟠 RISK OFF" if score<75 else "🔴 STRONG RISK OFF"))
-    return score,regime,reasons
-
-score,regime,reasons=risk_score(data)
-st.subheader("🚦 Market Regime")
-c1,c2=st.columns([1,2])
-c1.metric("Risk Score", f"{score}/100")
-c2.metric("현재 상태", regime)
-if reasons:
-    st.write("주의 요인: " + " · ".join(reasons))
-else:
-    st.write("현재 계산된 주요 위험 신호가 크지 않습니다.")
-
-st.subheader("💰 Cash Plan")
-need=max(0, target + emergency + buffer - cash - loan)
-c1,c2,c3,c4=st.columns(4)
-c1.metric("필요 현금", f"₩{target:,.0f}")
-c2.metric("현재 확보", f"₩{cash+loan:,.0f}")
-c3.metric("추가 매도 필요", f"₩{need:,.0f}")
-c4.metric("기준일", "2026-12-18")
-
-# Portfolio editor
-st.subheader("📈 My Portfolio")
-edited=st.data_editor(
-    DEFAULT,
-    num_rows="dynamic",
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Shares": st.column_config.NumberColumn(format="%.4f"),
-        "Avg KRW": st.column_config.NumberColumn(format="₩%d"),
-    }
+st.subheader("2. 종목 정보 확인 및 티커 연결")
+st.write("‘시장 티커’ 열을 직접 입력해 주세요. 티커가 없거나 가격 데이터 조회가 안 되면 매도/유지를 임의로 추천하지 않고 판단 보류합니다.")
+edited = st.data_editor(
+    portfolio, use_container_width=True, hide_index=True, num_rows="fixed",
+    disabled=["종목명", "종목코드", "평가금액(원)", "손익금액(원)", "수익률(%)", "보유수량", "증권사"],
+    column_config={"시장 티커": st.column_config.TextColumn("시장 티커", help="예: QQQM, NVDA, AAPL")},
+    key="holdings_editor"
 )
+edited["시장 티커"] = edited["시장 티커"].fillna("").astype(str).str.strip().str.upper()
+for col in ["평가금액(원)", "손익금액(원)", "수익률(%)", "보유수량"]:
+    edited[col] = edited[col].apply(num)
 
-ptickers=[str(x).upper().strip() for x in edited["Ticker"] if str(x).strip()]
-pdata=get_data(ptickers)
+st.subheader("3. 시장 지표 분석")
+if st.button("📈 시장 지표 분석 및 매도 판단 생성", type="primary"):
+    stats = {}
+    for ticker in sorted(set(t for t in edited["시장 티커"] if t)):
+        with st.spinner(f"{ticker} 가격 데이터 조회 중..."):
+            stats[ticker] = market_stats(ticker)
+    st.session_state["market_stats"] = stats
+    st.session_state["analysis_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-rows=[]
-for _,r in edited.iterrows():
-    t=str(r["Ticker"]).upper().strip()
-    if not t or t not in pdata: continue
-    p=pdata[t]
-    # Yahoo is USD for US stocks; this prototype converts using current KRW/USD.
-    fx=data.get("KRW=X",{}).get("price",1400)
-    value=float(r["Shares"])*p["price"]*fx
-    avg=float(r["Avg KRW"])
-    cost=float(r["Shares"])*avg
-    ret=(value/cost-1)*100 if cost else 0
-    dd=(p["price"]/p["high"]-1)*100
-    risk=30
-    if not np.isnan(p["ma200"]) and p["price"]<p["ma200"]: risk+=20
-    if dd<-15: risk+=20
-    if p["rsi"]>75: risk+=5
-    rows.append([t,value,ret,dd,p["rsi"],risk])
+stats = st.session_state.get("market_stats", {})
+if not stats:
+    st.info("티커를 입력한 뒤 시장 지표 분석 버튼을 눌러 주세요.")
+    st.stop()
+if st.session_state.get("analysis_time"):
+    st.caption("마지막 시장 분석: " + st.session_state["analysis_time"])
 
-pf=pd.DataFrame(rows,columns=["Ticker","Value","Return %","Drawdown %","RSI","Risk"])
-if not pf.empty:
-    pf["Weight %"]=pf["Value"]/pf["Value"].sum()*100
-    priority=pf.sort_values(["Risk","Weight %"],ascending=False)
-    st.dataframe(
-        pf[["Ticker","Value","Weight %","Return %","Drawdown %","RSI","Risk"]]
-        .style.format({"Value":"₩{:,.0f}","Weight %":"{:.1f}%","Return %":"{:.1f}%","Drawdown %":"{:.1f}%","RSI":"{:.0f}","Risk":"{:.0f}"}),
-        use_container_width=True, hide_index=True
-    )
+total = edited["평가금액(원)"].sum()
+results = []
+for _, row in edited.iterrows():
+    ticker = str(row["시장 티커"]).strip().upper()
+    s = stats.get(ticker) if ticker else None
+    action, pct, why, signal = recommendation(row, s, days_left, shortfall, total)
+    out = row.to_dict()
+    out.update({"판단": action, "제안 매도 비율(%)": pct, "판단 근거": why, "시장 신호": signal})
+    if s:
+        out.update(s)
+    else:
+        out.update({"최근 종가": None, "SMA20": None, "SMA50": None, "20거래일 변화(%)": None,
+                    "연환산 변동성(%)": None, "3개월 고점 대비(%)": None, "데이터 일자": None})
+    results.append(out)
 
-    st.subheader("🎯 Sell Priority")
-    for i,(_,r) in enumerate(priority.iterrows(),1):
-        st.write(f"**{i}. {r['Ticker']}** — Risk {r['Risk']:.0f} / 보유비중 {r['Weight %']:.1f}%")
+rec = pd.DataFrame(results)
+order = {"매도 우선 검토": 0, "매도": 1, "일부 매도": 2, "유지 또는 분할 매도": 3, "판단 보류": 4}
+rec["_order"] = rec["판단"].map(order).fillna(5)
+rec["비중(%)"] = rec["평가금액(원)"].apply(lambda x: num(x) / total * 100 if total > 0 else 0)
+rec = rec.sort_values(["_order", "제안 매도 비율(%)", "평가금액(원)"], ascending=[True, False, False]).drop(columns="_order")
 
-    st.subheader("🗓️ Monthly Sell Plan")
-    weights={ "10월":0.30, "11월":0.35, "12월":0.35 }
-    adj=1.0 if score<40 else (1.15 if score<60 else (1.30 if score<75 else 1.50))
-    remain=need
-    monthly=[]
-    for m,w in weights.items():
-        x=min(remain, need*w*adj)
-        monthly.append([m,x])
-        remain-=x
-    st.dataframe(pd.DataFrame(monthly,columns=["월","권장 현금화 목표"]).style.format({"권장 현금화 목표":"₩{:,.0f}"}),use_container_width=True,hide_index=True)
-else:
-    st.info("포트폴리오 종목을 입력하세요.")
+st.subheader("4. 오늘의 매도 판단")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("주식 평가금액", krw(total))
+m2.metric("목표일까지", f"{days_left}일")
+m3.metric("현금 목표", krw(target_cash))
+m4.metric("미확보 현금", krw(shortfall))
+if days_left <= 45:
+    st.warning("잔금일까지 45일 이하입니다. 잔금에 필요한 돈은 주식 변동성에 노출되지 않도록 실제 현금화 일정을 확인하세요.")
+st.caption("규칙은 기한, 20/50일 이동평균, 최근 20거래일 수익률, 변동성, 고점 대비 하락, 종목 집중도를 사용합니다. 예측이나 수익 보장은 아닙니다.")
+
+display_cols = ["판단", "종목명", "시장 티커", "평가금액(원)", "비중(%)", "제안 매도 비율(%)",
+                "판단 근거", "시장 신호", "20거래일 변화(%)", "연환산 변동성(%)", "3개월 고점 대비(%)", "데이터 일자"]
+st.dataframe(rec[display_cols].style.format({
+    "평가금액(원)": "₩{:,.0f}", "비중(%)": "{:.2f}%", "제안 매도 비율(%)": "{:.0f}%",
+    "20거래일 변화(%)": "{:.2f}%", "연환산 변동성(%)": "{:.2f}%", "3개월 고점 대비(%)": "{:.2f}%"
+}, na_rep="—"), use_container_width=True, hide_index=True)
+
+st.subheader("5. 종목별 상세 판단")
+for _, row in rec.iterrows():
+    with st.expander(f"{row['판단']} · {row['종목명']} ({row['시장 티커'] or '티커 미연결'})",
+                     expanded=row["판단"] in ["매도 우선 검토", "매도", "일부 매도"]):
+        a, b, c = st.columns(3)
+        a.metric("평가금액", krw(row["평가금액(원)"]))
+        b.metric("제안 매도 비율", f"{num(row['제안 매도 비율(%)']):.0f}%")
+        c.metric("현재 수익률", f"{num(row['수익률(%)']):.2f}%")
+        st.write("**판단 근거**")
+        st.write(row["판단 근거"])
+        st.write("**시장 신호**")
+        st.write(row["시장 신호"])
+        if pd.notna(row.get("최근 종가")):
+            st.write(f"최근 종가: {row['최근 종가']:.2f} · 20일 평균: {row['SMA20']:.2f}")
+            if pd.notna(row.get("SMA50")):
+                st.write(f"50일 평균: {row['SMA50']:.2f}")
+        st.caption("제안은 규칙 기반 참고 정보입니다. 매도 전 세금, 환율, 수수료, 결제일과 잔금 필요액을 확인하세요.")
+
+st.download_button("📥 매도 판단 CSV 다운로드",
+    data=rec.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+    file_name="cashout_recommendations.csv", mime="text/csv")
+
+with st.expander("나무증권 API 요약"):
+    summary = st.session_state.get("nh_summary", {})
+    if summary:
+        st.write("평가금액 합계:", krw(summary.get("eal_amt_sum")))
+        st.write("평가손익 합계:", krw(summary.get("eal_pls_sum_amt")))
+    else:
+        st.caption("아직 잔고 조회 결과가 없습니다.")
 
 st.divider()
-st.caption("Prototype: 규칙 기반 리스크 관리 도구이며 수익률이나 시장 방향을 보장하지 않습니다. 데이터는 Yahoo Finance 지연/가용성에 영향을 받을 수 있습니다.")
-
-import time
-import requests
-import pandas as pd
-import streamlit as st
-
-
-def get_nhplug_token():
-    """세션에 유효한 토큰이 있으면 재사용."""
-    now = time.time()
-    token = st.session_state.get("nhplug_token")
-    expires_at = st.session_state.get("nhplug_token_expires_at", 0)
-
-    if token and now < expires_at:
-        return token
-
-    response = requests.post(
-        "https://api.nhplug.com:8443/oauth2/token",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded"
-        },
-        data={
-            "appkey": st.secrets["NHPLUG_APP_KEY"],
-            "appsecretkey": st.secrets["NHPLUG_APP_SECRET"],
-            "grant_type": "client_credentials",
-            "scope": "oob",
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    token = data.get("access_token")
-    if not token:
-        raise RuntimeError("접근 토큰이 응답에 없습니다.")
-
-    st.session_state["nhplug_token"] = token
-    st.session_state["nhplug_token_expires_at"] = (
-        now + int(data.get("expires_in", 86400)) - 60
-    )
-    return token
-
-
-def get_nhplug_us_balance():
-    token = get_nhplug_token()
-
-    response = requests.post(
-        "https://api.nhplug.com:8443/gbstock/inquiry/v1/balance",
-        headers={
-            "Content-Type": "application/json; charset=UTF-8",
-            "Authorization": f"Bearer {token}",
-        },
-        json={
-            "Input_0": {
-                "act_no": st.secrets["NHPLUG_ACCOUNT_NO"],
-                "qut_iqr_dit_cd": "9",
-                "fc_sec_trd_nat_cd": "200",
-                "cur_cd": "KRW",
-                "xns_dit_cd": "0",
-            }
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-st.subheader("나무 PLUG 해외주식 잔고")
-
-if st.button("나무 계좌 잔고 불러오기"):
-    try:
-        result = get_nhplug_us_balance()
-
-        if result.get("rsp_cd") != "00166":
-            st.error("API 조회 결과를 확인해 주세요.")
-            st.write("응답 코드:", result.get("rsp_cd"))
-            st.write("응답 메시지:", result.get("rsp_msg"))
-        else:
-            summary = result.get("Output_0", {})
-            holdings = result.get("Output_1", [])
-
-            st.metric(
-                "해외주식 평가금액 합계",
-                f'{summary.get("eal_amt_sum", 0):,.0f}원'
-            )
-            st.metric(
-                "평가손익 합계",
-                f'{summary.get("eal_pls_sum_amt", 0):,.0f}원'
-            )
-
-            if holdings:
-                df = pd.DataFrame(holdings)
-                columns = {
-                    "iem_cd": "종목코드",
-                    "iem_nm": "종목명",
-                    "cns_bse_bnc_qty": "보유수량",
-                    "sll_pbl_qty1": "매도가능수량",
-                    "krw_eal_amt": "원화평가금액",
-                    "krw_eal_pls_amt": "원화평가손익",
-                    "eal_pft_rt1": "평가수익률(%)",
-                }
-                available = [
-                    col for col in columns if col in df.columns
-                ]
-                df = df[available].rename(columns=columns)
-
-                st.dataframe(df, use_container_width=True)
-            else:
-                st.info("조회된 해외주식 보유 종목이 없어.")
-    except Exception:
-            except requests.exceptions.HTTPError as e:
-        st.error("API가 HTTP 오류를 반환했어.")
-        r = e.response
-
-        if r is not None:
-            st.write("HTTP 상태 코드:", r.status_code)
-
-            try:
-                data = r.json()
-                st.write("응답 코드:", data.get("rsp_cd", data.get("error", "미제공")))
-                st.write("응답 메시지:", data.get("rsp_msg", data.get("error_description", "미제공")))
-            except ValueError:
-                st.write("응답 본문을 JSON으로 읽지 못했어.")
-
-    except requests.exceptions.RequestException as e:
-        st.error("네트워크 요청에 실패했어.")
-        st.write("오류 종류:", type(e).__name__)
-
-    except Exception as e:
-        st.error("API 조회 중 오류가 발생했어.")
-        st.write("오류 종류:", type(e).__name__)
-        st.write("오류 메시지:", str(e))
+st.caption("가격 데이터는 Yahoo Finance(yfinance)를 통해 조회합니다. 데이터가 지연되거나 누락될 수 있으며, 공식 증권사 잔고/체결 가격을 대체하지 않습니다. 자동 매매는 실행하지 않습니다.")
