@@ -13,6 +13,7 @@ st.caption("목표일 기반 현금화 모드와 목표일 없는 장기 투자 
 BASE = "https://api.nhplug.com:8443"
 TOKEN_URL = BASE + "/oauth2/token"
 BALANCE_URL = BASE + "/gbstock/inquiry/v1/balance"
+KR_BALANCE_URL = BASE + "/krstock/inquiry/v1/assetStatus"
 COLS = ["종목명", "종목코드", "시장 티커", "평가금액(원)", "손익금액(원)", "수익률(%)", "보유수량", "증권사"]
 
 def num(x, default=0.0):
@@ -77,6 +78,69 @@ def nh_balance():
         rows = [rows]
     return data.get("Output_0", {}), rows if isinstance(rows, list) else []
 
+def nh_domestic_balance():
+    """NH PLUG 공식 가이드의 국내_주식_조회_자산현황 API."""
+    _, _, acct = secrets_values()
+    r = requests.post(
+        KR_BALANCE_URL,
+        headers={
+            "Content-Type": "application/json;charset=utf-8",
+            "Authorization": f"Bearer {token()}",
+        },
+        json={"Input_0": {
+            "act_no": acct,
+            "eal_aly_cd": "2",   # 시가평가
+            "aet_bse": "1",      # 순자산 기준
+            "qut_dit_cd": "UNT", # 통합시세
+            "aly_qut_cd": "1",  # 정규장 시세
+        }},
+        timeout=30,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"국내주식 자산현황 API HTTP 오류: {r.status_code}")
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError("국내주식 자산현황 응답이 JSON 형식이 아닙니다.")
+
+    rows = data.get("Output_1", [])
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        rows = []
+
+    # 공식 예시 응답은 rsp_cd/rsp_msg를 최상위에 두며 Output_0/Output_1로 결과를 반환한다.
+    if "Output_0" not in data and "Output_1" not in data:
+        raise RuntimeError(
+            f"국내주식 API 응답 오류: {data.get('rsp_cd', '코드 없음')} / "
+            f"{data.get('rsp_msg', '응답 데이터 없음')}"
+        )
+    return data.get("Output_0", {}), rows
+
+def from_domestic_api(rows, broker="나무증권 국내"):
+    out = []
+    for x in rows:
+        code = str(x.get("iem_cd", "")).strip()
+        # API 필드 길이가 12자리로 정의돼 있어도 국내 상장 종목코드는 앞 6자리를 사용
+        import re
+        if re.match(r"^\d{6}", code):
+            code = code[:6]
+        qty = num(x.get("itg_bnc_qty", x.get("rsdl_qty", x.get("bnc_qty", 0))))
+        value = num(x.get("eal_amt", x.get("evlu_amt", 0)))
+        pnl = num(x.get("eal_pls_amt", x.get("evlu_pfls_amt", 0)))
+        rate = num(x.get("pft_rt", x.get("evlu_pfls_rt", 0)))
+        out.append({
+            "종목명": x.get("iem_nm", "이름 없음"),
+            "종목코드": code,
+            "시장 티커": "",
+            "평가금액(원)": value,
+            "손익금액(원)": pnl,
+            "수익률(%)": rate,
+            "보유수량": qty,
+            "증권사": broker,
+        })
+    return pd.DataFrame(out, columns=COLS)
+
 def from_api(rows, broker):
     out = []
     for x in rows:
@@ -96,6 +160,17 @@ def resolve_ticker(name, code=""):
     import re
     name = str(name or "").strip()
     code = str(code or "").strip().upper()
+
+    # 국내 상장 종목은 6자리 종목코드에 .KS(코스피) 또는 .KQ(코스닥)를 붙여 검증한다.
+    if code and re.fullmatch(r"\d{6}", code):
+        for suffix in (".KS", ".KQ"):
+            candidate = code + suffix
+            try:
+                hist = yf.Ticker(candidate).history(period="1mo", interval="1d")
+                if not hist.empty:
+                    return candidate, f"국내 종목코드로 자동 연결: {candidate}"
+            except Exception:
+                pass
 
     # API의 종목코드가 이미 미국 시장 티커처럼 보이면 먼저 검증한다.
     if code and re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", code):
@@ -188,16 +263,24 @@ def market_stats(ticker):
     except Exception:
         return None
 
-def expert_perspectives(row, stats, total, mode):
-    """공개된 투자 원칙을 설명용 관점으로 적용한다. 특정 전문가의 실시간 종목 추천은 아니다."""
+def expert_perspectives(row, stats, total, mode, shortfall=0, days=999999):
+    """Separate source-based investing frameworks from actual expert stock recommendations."""
     val = num(row.get("평가금액(원)"))
     weight = val / total * 100 if total > 0 else 0
+    ticker = str(row.get("시장 티커", "")).strip().upper() or "티커 미연결"
     if not stats:
-        return [
-            ("하워드 막스 · 위험 관리", "가격 데이터가 없어 위험 신호를 평가하기 어렵습니다. 데이터 확인 전에는 강한 보유/매도 판단을 피하세요."),
-            ("존 머피 · 추세 분석", "티커 또는 가격 데이터가 확인되면 이동평균과 모멘텀을 기준으로 추세를 평가합니다."),
-            ("CFA · 목표·유동성", "시장 신호를 해석하기 전에 잔금 일정, 필요한 현금, 세금과 유동성 제약을 먼저 확인하세요.")
-        ]
+        return {
+            "views": [
+                ("하워드 막스 · 위험 관리", "가격 데이터가 없어 위험 신호를 평가할 수 없습니다. 불확실한 상태에서 강한 보유·매도 판단을 내리지 않는 것이 우선입니다."),
+                ("존 머피 · 추세 추종", "가격 데이터가 없어 이동평균과 모멘텀을 평가할 수 없습니다."),
+                ("CFA · 목표·유동성", "잔금 일정, 필요한 현금, 세금 및 유동성 제약을 먼저 확인하세요.")
+            ],
+            "summary": "판단 보류 — 시장 데이터가 없어 투자 철학별 판단을 비교할 수 없습니다.",
+            "counter": "티커와 가격 데이터가 확인되면 추세·위험 신호를 다시 평가할 수 있습니다.",
+            "change": "가격 데이터 확보 및 보유 종목/티커 일치 여부 확인",
+            "risk_count": None,
+            "trend_score": None,
+        }
 
     close = num(stats.get("최근 종가"))
     sma20 = num(stats.get("SMA20"))
@@ -206,45 +289,66 @@ def expert_perspectives(row, stats, total, mode):
     vol = stats.get("연환산 변동성(%)")
     dd = stats.get("3개월 고점 대비(%)")
     risks = []
-    if close < sma20:
-        risks.append("종가가 20일 평균선 아래")
-    if sma50 is not None and close < sma50:
-        risks.append("종가가 50일 평균선 아래")
-    if ret20 is not None and ret20 <= -8:
-        risks.append("최근 20거래일 약세")
-    if vol is not None and vol >= 45:
-        risks.append("높은 변동성")
-    if dd is not None and dd <= -15:
-        risks.append("3개월 고점 대비 큰 하락")
-    if weight >= 25:
-        risks.append("포트폴리오 내 비중 집중")
+    if close < sma20: risks.append("종가가 20일 평균선 아래")
+    if sma50 is not None and close < sma50: risks.append("종가가 50일 평균선 아래")
+    if ret20 is not None and ret20 <= -8: risks.append("최근 20거래일 약세")
+    if vol is not None and vol >= 45: risks.append("높은 변동성")
+    if dd is not None and dd <= -15: risks.append("3개월 고점 대비 큰 하락")
+    if weight >= 25: risks.append("포트폴리오 내 비중 집중")
 
-    trend = "20일 평균선 위" if close >= sma20 else "20일 평균선 아래"
-    if sma50 is not None:
-        trend += ", 50일 평균선 위" if close >= sma50 else ", 50일 평균선 아래"
-    if ret20 is not None:
-        trend += f", 최근 20거래일 {ret20:+.1f}%"
-    trend_text = f"현재 기술적 상태는 {trend}입니다. "
-    if close < sma20 and sma50 is not None and close < sma50:
-        trend_text += "단기·중기 추세가 모두 약한 편이므로 반등만을 전제로 보유 판단을 내리지 말고 추가 확인이 필요합니다."
-    elif close < sma20:
-        trend_text += "단기 약세 신호입니다. 중기 추세와 거래량 등 추가 근거를 함께 확인하세요."
+    # Independent lenses, not endorsements or direct statements by the named people.
+    trend_score = int(close >= sma20) + int(sma50 is not None and close >= sma50) + int(ret20 is not None and ret20 > 0)
+    trend_max = 3 if sma50 is not None and ret20 is not None else 2
+    if close >= sma20 and (sma50 is None or close >= sma50) and (ret20 is None or ret20 > 0):
+        trend_label = "추세 관점: 긍정"
+        trend_text = "종가와 단기 이동평균의 관계가 상대적으로 우호적입니다. 이는 추세 지속을 보장하지 않으며, 이동평균은 후행 지표입니다."
+    elif close < sma20 and sma50 is not None and close < sma50 and (ret20 is not None and ret20 <= 0):
+        trend_label = "추세 관점: 부정"
+        trend_text = "단기·중기 추세와 최근 모멘텀이 약합니다. 반등을 가정하기보다 추세가 회복되는지 확인할 필요가 있습니다."
     else:
-        trend_text += "이동평균 기준으로는 단기 추세가 유지되고 있지만, 이것만으로 추가 상승을 보장하지는 않습니다."
+        trend_label = "추세 관점: 혼조"
+        trend_text = "추세 신호가 엇갈립니다. 단일 이동평균 돌파만으로 전량 매도·추가 매수를 결정하기보다 다음 데이터 갱신을 확인하세요."
 
-    risk_text = "확인된 위험 요인: " + ", ".join(risks) + "." if risks else "설정한 주요 위험 신호가 뚜렷하게 겹치지는 않습니다. 다만 신호 부재가 안전이나 저평가를 의미하지는 않습니다."
-    risk_text += f" 현재 포트폴리오 비중은 {weight:.1f}%입니다."
+    risk_count = int(close < sma20) + int(sma50 is not None and close < sma50) + int(ret20 is not None and ret20 <= -8) + int(vol is not None and vol >= 45) + int(dd is not None and dd <= -15) + int(weight >= 25)
+    risk_label = "위험 관리 관점: 주의" if risk_count >= 3 else ("위험 관리 관점: 점검" if risk_count == 2 else "위험 관리 관점: 뚜렷한 경보 제한적")
+    risk_text = ("확인된 위험 요인: " + ", ".join(risks) + ".") if risks else "설정한 주요 위험 신호가 뚜렷하게 겹치지는 않습니다. 신호 부재가 안전이나 저평가를 뜻하지는 않습니다."
+    risk_text += f" 포트폴리오 비중은 {weight:.1f}%이며, 이 화면의 위험 임계치는 검증 전인 운영 가정입니다."
 
     if mode == "목표일 있음":
-        liquidity_text = "목표일 기반 판단에서는 시장 전망보다 잔금에 필요한 현금 확보 가능성이 우선입니다. 필요한 현금에 해당하는 물량은 가격 반등을 기다리기보다 결제일·세금·환전 시간을 감안해 별도로 관리하세요."
+        liquidity_label = "목표·유동성 관점: 현금 계획 우선"
+        liquidity_text = f"목표일까지 {days}일 남았습니다. 입력된 미확보 현금 목표는 {krw(shortfall)}입니다. 잔금에 필요한 금액은 시장 전망과 분리해 확보 계획을 세우고, 환전·매도 결제·세금 일정을 확인하세요."
     else:
-        liquidity_text = "목표일이 없는 경우에는 날짜만으로 매도하지 않습니다. 투자 근거, 분산 상태와 위험 허용도를 점검하고, 비중이 과도하거나 여러 위험 신호가 겹칠 때만 리밸런싱을 검토하세요."
+        liquidity_label = "목표·유동성 관점: 투자 기간 중심"
+        liquidity_text = "날짜만을 이유로 매도하지 않습니다. 목표 비중, 투자 논리, 세금, 비상자금과 위험 허용도를 점검하고 필요할 때 리밸런싱을 검토합니다."
 
-    return [
-        ("하워드 막스 · 위험 관리 관점", risk_text + " 이는 위험 신호를 정리한 참고 해석이며, 하워드 막스의 해당 종목에 대한 실제 발언이나 추천은 아닙니다."),
-        ("존 머피 · 기술적 분석 관점", trend_text),
-        ("CFA · 목표·유동성 관점", liquidity_text)
-    ]
+    if risk_count >= 3 and trend_score <= 1:
+        summary = "종합: 위험 축소 검토 — 위험 신호가 여러 개이고 추세 확인도 약합니다. 전량 매도를 자동 지시하는 결론은 아닙니다."
+        counter = "반대 근거: 단기 약세는 일시적 조정일 수 있고, 가격 지표만으로 기업·ETF의 장기 투자 논리가 훼손됐다고 단정할 수 없습니다."
+        change = "가격이 20/50일 평균선을 회복하고 모멘텀이 개선되는지, 또는 위험 신호가 완화되는지 확인"
+    elif risk_count <= 1 and trend_score >= 2:
+        summary = "종합: 보유 검토 — 현재 가격 추세는 상대적으로 우호적이고 설정한 위험 신호가 제한적입니다."
+        counter = "반대 근거: 좋은 추세라도 고평가, 종목 집중, 향후 현금 수요 또는 급격한 시장 변화를 배제하지 못합니다."
+        change = "가격이 주요 평균선 아래로 내려가거나 변동성·고점 대비 하락·집중 위험이 동시에 커지는지 확인"
+    else:
+        summary = "종합: 관찰 / 일부 비중 조정 검토 — 추세와 위험 신호가 혼재하거나 중간 수준입니다."
+        counter = "반대 근거: 혼재 신호는 매매 비용과 잦은 매매를 유발할 수 있습니다. 장기 투자 논리와 포트폴리오 전체 비중을 함께 확인하세요."
+        change = "추세 신호와 위험 신호가 같은 방향으로 더 명확해지는지 확인"
+
+    if mode == "목표일 있음" and shortfall > 0 and days <= 45:
+        summary += " 목표일이 가까우므로 필요한 잔금 현금 확보가 시장 전망보다 우선입니다."
+
+    return {
+        "views": [
+            ("하워드 막스 · 위험 관리 관점", risk_label + ". " + risk_text),
+            ("존 머피 · 추세 분석 관점", trend_label + ". " + trend_text),
+            ("CFA · 목표·유동성 관점", liquidity_label + ". " + liquidity_text),
+        ],
+        "summary": summary,
+        "counter": counter,
+        "change": change,
+        "risk_count": risk_count,
+        "trend_score": f"{trend_score}/{trend_max}",
+    }
 
 def recommendation(row, stats, days, shortfall, total, mode="목표일 있음"):
     val = num(row["평가금액(원)"])
@@ -327,31 +431,49 @@ else:
     shortfall = 0
 
 st.subheader("1. 보유 자산 불러오기")
-c1, c2 = st.columns([1, 2])
+c1, c2, c3 = st.columns(3)
 with c1:
-    if st.button("🔄 나무증권 미국 주식 잔고 조회", type="primary", use_container_width=True):
+    if st.button("🔄 나무증권 국내주식 잔고 조회", type="primary", use_container_width=True):
         try:
-            with st.spinner("잔고 조회 중..."):
-                summary, items = nh_balance()
-            st.session_state["nh_df"] = from_api(items, "나무증권")
-            st.session_state["nh_summary"] = summary
-            st.session_state["nh_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            st.success(f"{len(items)}개 종목을 불러왔습니다.")
+            with st.spinner("국내주식 잔고 조회 중..."):
+                summary, items = nh_domestic_balance()
+            st.session_state["nh_kr_df"] = from_domestic_api(items)
+            st.session_state["nh_kr_summary"] = summary
+            st.session_state["nh_kr_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.success(f"국내주식 {len(items)}개 종목을 불러왔습니다.")
         except requests.exceptions.Timeout:
-            st.error("API 요청 시간이 초과되었습니다. 잠시 후 다시 시도하세요.")
+            st.error("국내주식 API 요청 시간이 초과되었습니다. 잠시 후 다시 시도하세요.")
         except requests.exceptions.RequestException as exc:
-            st.error(f"네트워크 오류: {type(exc).__name__}")
+            st.error(f"국내주식 네트워크 오류: {type(exc).__name__}")
         except Exception as exc:
-            st.error(f"잔고 조회 실패: {type(exc).__name__}")
+            st.error(f"국내주식 잔고 조회 실패: {type(exc).__name__}")
             st.code(str(exc))
 with c2:
-    st.caption("티커는 증권사 종목코드와 다를 수 있어 자동 추정하지 않습니다. 잔고 조회 후 티커를 직접 연결해 주세요.")
+    if st.button("🌎 나무증권 미국 주식 잔고 조회", use_container_width=True):
+        try:
+            with st.spinner("해외주식 잔고 조회 중..."):
+                summary, items = nh_balance()
+            st.session_state["nh_df"] = from_api(items, "나무증권 해외")
+            st.session_state["nh_summary"] = summary
+            st.session_state["nh_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.success(f"해외주식 {len(items)}개 종목을 불러왔습니다.")
+        except requests.exceptions.Timeout:
+            st.error("해외주식 API 요청 시간이 초과되었습니다. 잠시 후 다시 시도하세요.")
+        except requests.exceptions.RequestException as exc:
+            st.error(f"해외주식 네트워크 오류: {type(exc).__name__}")
+        except Exception as exc:
+            st.error(f"해외주식 잔고 조회 실패: {type(exc).__name__}")
+            st.code(str(exc))
+with c3:
+    st.caption("국내·해외 잔고는 같은 NH PLUG 키와 계좌 설정을 사용합니다. 국내 주가 이력은 Yahoo Finance에서 조회하며 실시간 시세를 보장하지 않습니다.")
 
 if st.session_state.get("nh_time"):
-    st.caption("나무증권 마지막 조회: " + st.session_state["nh_time"])
+    st.caption("나무증권 해외주식 마지막 조회: " + st.session_state["nh_time"])
+if st.session_state.get("nh_kr_time"):
+    st.caption("나무증권 국내주식 마지막 조회: " + st.session_state["nh_kr_time"])
 
-st.markdown("**다른 증권사 CSV 업로드**")
-st.caption("필수 열: 종목명, 평가금액(원). 시장 분석을 위해 시장 티커 열도 입력하세요. 예: QQQM, NVDA, AAPL.")
+st.markdown("**다른 증권사 CSV 업로드 (선택 사항)**")
+st.caption("필수 열: 종목명, 평가금액(원). 시장 분석을 위해 시장 티커 열도 입력하세요. 예: QQQM, NVDA, AAPL, 삼성전자 005930.KS, 에코프로 086520.KQ.")
 upload = st.file_uploader("보유 종목 CSV", type=["csv"])
 other = pd.DataFrame(columns=COLS)
 if upload:
@@ -362,10 +484,11 @@ if upload:
         st.error(f"CSV 처리 실패: {exc}")
 
 nh = st.session_state.get("nh_df", pd.DataFrame(columns=COLS))
-sources = [d for d in [nh, other] if d is not None and not d.empty]
+nh_kr = st.session_state.get("nh_kr_df", pd.DataFrame(columns=COLS))
+sources = [d for d in [nh_kr, nh, other] if d is not None and not d.empty]
 portfolio = pd.concat(sources, ignore_index=True) if sources else pd.DataFrame(columns=COLS)
 if portfolio.empty:
-    st.info("잔고를 조회하거나 다른 증권사 CSV를 업로드해 주세요.")
+    st.info("나무증권 국내/해외 잔고를 조회하거나, 다른 증권사는 선택적으로 CSV를 업로드해 주세요.")
     st.stop()
 
 # 자동 티커 연결 결과는 rerun 이후에도 유지한다.
@@ -400,7 +523,7 @@ if st.button("🔎 보유 종목 티커 자동 찾기", use_container_width=True
 edited = st.data_editor(
     portfolio, use_container_width=True, hide_index=True, num_rows="fixed",
     disabled=["종목명", "종목코드", "평가금액(원)", "손익금액(원)", "수익률(%)", "보유수량", "증권사"],
-    column_config={"시장 티커": st.column_config.TextColumn("시장 티커", help="자동 연결이 안 된 경우 예: QQQM, NVDA, AAPL")},
+    column_config={"시장 티커": st.column_config.TextColumn("시장 티커", help="자동 연결이 안 된 경우 예: QQQM, NVDA, 005930.KS, 086520.KQ")},
     key="holdings_editor"
 )
 edited["시장 티커"] = edited["시장 티커"].fillna("").astype(str).str.strip().str.upper()
@@ -459,7 +582,14 @@ else:
     m4.metric("위험 신호", "다중 지표")
     st.info("목표일 없음 모드: 일정에 따른 강제 매도는 적용하지 않습니다. 여러 위험 신호가 겹칠 때만 비중 축소를 검토합니다.")
 st.caption("규칙은 선택한 모드에 따라 기한 또는 20/50일 이동평균, 최근 20거래일 수익률, 변동성, 고점 대비 하락, 종목 집중도를 참고합니다. 예측이나 수익 보장은 아닙니다.")
-st.markdown("**전문가 원칙 참고 자료** · [Oaktree / Howard Marks 투자 메모](https://www.oaktreecapital.com/insights) · [CFA Institute: 자산배분 개요](https://www.cfainstitute.org/insights/professional-learning/refresher-readings/2026/overview-asset-allocation) · [CFA Institute: 현실적 제약을 반영한 자산배분](https://www.cfainstitute.org/insights/professional-learning/refresher-readings/2026/asset-allocation-with-real-world-constraints)")
+with st.expander("📚 전문가의 실제 공개 자료와 판단 프레임워크", expanded=True):
+    st.caption("실제 공개 자료와 앱이 계산한 지표 해석은 별개입니다. 아래 자료는 전문가들이 발표한 내용이며, 특정 보유 종목에 대한 실시간 추천은 아닙니다. 링크는 원문을 직접 확인하기 위한 것입니다.")
+    st.markdown("- **하워드 막스 / Oaktree** — [AI Hurtles Ahead (2026-02-26)](https://www.oaktreecapital.com/insights/memo/ai-hurtles-ahead): AI와 투자 판단에 관한 실제 메모. 개별 종목 추천으로 해석하지 않습니다.")
+    st.markdown("- **하워드 막스 / Oaktree** — [Shall We Repeal the Laws of Economics – Part III (2026-09-22)](https://www.oaktreecapital.com/insights/memo/shall-we-repeal-the-laws-of-economics---part-iii): 경제 개입과 인센티브에 관한 실제 메모로, 시장 전망을 단정하는 신호가 아닙니다.")
+    st.markdown("- **존 머피** — [Technical Analysis of the Financial Markets 출판사 안내](https://www.penguinrandomhouse.com/books/350647/technical-analysis-of-the-financial-markets-by-john-j-murphy/): 이동평균·추세 등 기술적 분석의 참고 문헌입니다.")
+    st.markdown("- **CFA Institute** — [Asset Allocation with Real-World Constraints (2026)](https://www.cfainstitute.org/insights/professional-learning/refresher-readings/2026/asset-allocation-with-real-world-constraints): 투자기간, 유동성, 세금과 외부 제약을 고려하는 프레임워크입니다.")
+    st.markdown("- **김승호** — [돈의 속성](https://www.yes24.com/Product/Search?domain=ALL&query=%EB%8F%88%EC%9D%98%20%EC%86%8D%EC%84%B1): 장기적 자산 축적과 기업 선별에 관한 관점을 참고합니다. 이 앱의 해석이며 저자의 특정 종목 추천이 아닙니다.")
+    st.caption("현재 버전은 이 출처들을 실시간으로 자동 수집하거나 원문 전체를 요약하지 않습니다. 링크에 표시된 발행일과 원문을 직접 확인하세요.")
 
 display_cols = ["판단", "종목명", "시장 티커", "평가금액(원)", "비중(%)", "제안 매도 비율(%)",
                 "판단 근거", "시장 신호", "20거래일 변화(%)", "연환산 변동성(%)", "3개월 고점 대비(%)", "데이터 일자"]
@@ -484,24 +614,41 @@ for _, row in rec.iterrows():
             st.write(f"최근 종가: {row['최근 종가']:.2f} · 20일 평균: {row['SMA20']:.2f}")
             if pd.notna(row.get("SMA50")):
                 st.write(f"50일 평균: {row['SMA50']:.2f}")
-        st.markdown("**전문가 원칙 기반 참고 의견**")
-        st.caption("아래는 투자 서적·전문 자료의 원칙을 현재 지표에 적용한 해석입니다. 전문가가 이 종목을 직접 평가한 실시간 의견이나 매수·매도 추천이 아닙니다.")
-        for perspective_title, perspective_text in expert_perspectives(row, stats.get(str(row.get("시장 티커", "")).strip().upper()), total, mode):
+        st.markdown("**투자 철학별 독립 판단**")
+        st.caption("아래 의견은 공개된 투자 프레임워크를 현재 지표에 적용한 앱의 해석입니다. 이름이 표시된 전문가가 이 종목을 직접 평가하거나 추천했다는 뜻은 아닙니다.")
+        assessment = expert_perspectives(
+            row, stats.get(str(row.get("시장 티커", "")).strip().upper()), total, mode,
+            shortfall=shortfall, days=days_left
+        )
+        for perspective_title, perspective_text in assessment["views"]:
             st.markdown(f"**{perspective_title}**")
             st.write(perspective_text)
-        st.caption("참고 자료: Howard Marks/Oaktree 투자 메모 · John J. Murphy의 기술적 분석 체계 · CFA Institute의 자산배분 및 현실적 제약 자료")
-        st.caption("제안은 규칙 기반 참고 정보입니다. 매도 전 세금, 환율, 수수료, 결제일과 잔금 필요액을 확인하세요.")
+        st.markdown("**종합 판단 및 반대 근거**")
+        st.info(assessment["summary"])
+        st.write("**반대 관점 / 이 판단이 틀릴 수 있는 이유**")
+        st.write(assessment["counter"])
+        st.write("**판단을 바꿀 조건**")
+        st.write(assessment["change"])
+        st.caption(f"참고 지표: 위험 신호 {assessment['risk_count'] if assessment['risk_count'] is not None else '산출 불가'}개 · 추세 점수 {assessment['trend_score'] if assessment['trend_score'] is not None else '산출 불가'}")
+        st.caption("제안은 규칙 기반 참고 정보입니다. 임계치는 검증 전 가정이며, 실제 주문 전에 세금·환율·수수료·결제일과 잔금 필요액을 확인하세요.")
 
 st.download_button("📥 매도 판단 CSV 다운로드",
     data=rec.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
     file_name="cashout_recommendations.csv", mime="text/csv")
 
 with st.expander("나무증권 API 요약"):
-    summary = st.session_state.get("nh_summary", {})
-    if summary:
-        st.write("평가금액 합계:", krw(summary.get("eal_amt_sum")))
-        st.write("평가손익 합계:", krw(summary.get("eal_pls_sum_amt")))
-    else:
+    kr_summary = st.session_state.get("nh_kr_summary", {})
+    us_summary = st.session_state.get("nh_summary", {})
+    if kr_summary:
+        st.markdown("**국내주식**")
+        st.write("총평가금액:", krw(kr_summary.get("tot_eal_amt")))
+        st.write("총평가손익:", krw(kr_summary.get("tot_eal_pls_amt")))
+        st.write("출금가능금액:", krw(kr_summary.get("drn_pbl_amt")))
+    if us_summary:
+        st.markdown("**해외주식**")
+        st.write("평가금액 합계:", krw(us_summary.get("eal_amt_sum")))
+        st.write("평가손익 합계:", krw(us_summary.get("eal_pls_sum_amt")))
+    if not kr_summary and not us_summary:
         st.caption("아직 잔고 조회 결과가 없습니다.")
 
 st.divider()
