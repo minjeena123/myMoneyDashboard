@@ -4,7 +4,34 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import date
+import requests
+import streamlit as st
 
+if st.button("나무 PLUG 연결 테스트"):
+    try:
+        response = requests.post(
+            "https://api.nhplug.com:8443/oauth2/token",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            data={
+                "appkey": st.secrets["NHPLUG_APP_KEY"],
+                "appsecretkey": st.secrets["NHPLUG_APP_SECRET"],
+                "grant_type": "client_credentials",
+                "scope": "oob",
+            },
+            timeout=20,
+        )
+
+        if response.ok and response.json().get("access_token"):
+            st.success("인증 성공! 나무 PLUG에 연결할 준비가 됐어.")
+        else:
+            st.error(
+                f"인증 실패: HTTP {response.status_code}. "
+                "API 신청 상태와 Secrets 설정을 확인해 줘."
+            )
+    except Exception:
+        st.error("연결에 실패했어. Secrets와 네트워크 설정을 확인해 줘.")
 st.set_page_config(
     page_title="My Market Dashboard",
     page_icon="📊",
