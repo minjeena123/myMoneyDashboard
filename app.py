@@ -231,3 +231,117 @@ else:
 
 st.divider()
 st.caption("Prototype: 규칙 기반 리스크 관리 도구이며 수익률이나 시장 방향을 보장하지 않습니다. 데이터는 Yahoo Finance 지연/가용성에 영향을 받을 수 있습니다.")
+
+import time
+import requests
+import pandas as pd
+import streamlit as st
+
+
+def get_nhplug_token():
+    """세션에 유효한 토큰이 있으면 재사용."""
+    now = time.time()
+    token = st.session_state.get("nhplug_token")
+    expires_at = st.session_state.get("nhplug_token_expires_at", 0)
+
+    if token and now < expires_at:
+        return token
+
+    response = requests.post(
+        "https://api.nhplug.com:8443/oauth2/token",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        data={
+            "appkey": st.secrets["NHPLUG_APP_KEY"],
+            "appsecretkey": st.secrets["NHPLUG_APP_SECRET"],
+            "grant_type": "client_credentials",
+            "scope": "oob",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    token = data.get("access_token")
+    if not token:
+        raise RuntimeError("접근 토큰이 응답에 없습니다.")
+
+    st.session_state["nhplug_token"] = token
+    st.session_state["nhplug_token_expires_at"] = (
+        now + int(data.get("expires_in", 86400)) - 60
+    )
+    return token
+
+
+def get_nhplug_us_balance():
+    token = get_nhplug_token()
+
+    response = requests.post(
+        "https://api.nhplug.com:8443/gbstock/inquiry/v1/balance",
+        headers={
+            "Content-Type": "application/json; charset=UTF-8",
+            "Authorization": f"Bearer {token}",
+        },
+        json={
+            "Input_0": {
+                "act_no": st.secrets["NHPLUG_ACCOUNT_NO"],
+                "qut_iqr_dit_cd": "9",
+                "fc_sec_trd_nat_cd": "200",
+                "cur_cd": "KRW",
+                "xns_dit_cd": "0",
+            }
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+st.subheader("나무 PLUG 해외주식 잔고")
+
+if st.button("나무 계좌 잔고 불러오기"):
+    try:
+        result = get_nhplug_us_balance()
+
+        if result.get("rsp_cd") != "00166":
+            st.error("API 조회 결과를 확인해 주세요.")
+            st.write("응답 코드:", result.get("rsp_cd"))
+            st.write("응답 메시지:", result.get("rsp_msg"))
+        else:
+            summary = result.get("Output_0", {})
+            holdings = result.get("Output_1", [])
+
+            st.metric(
+                "해외주식 평가금액 합계",
+                f'{summary.get("eal_amt_sum", 0):,.0f}원'
+            )
+            st.metric(
+                "평가손익 합계",
+                f'{summary.get("eal_pls_sum_amt", 0):,.0f}원'
+            )
+
+            if holdings:
+                df = pd.DataFrame(holdings)
+                columns = {
+                    "iem_cd": "종목코드",
+                    "iem_nm": "종목명",
+                    "cns_bse_bnc_qty": "보유수량",
+                    "sll_pbl_qty1": "매도가능수량",
+                    "krw_eal_amt": "원화평가금액",
+                    "krw_eal_pls_amt": "원화평가손익",
+                    "eal_pft_rt1": "평가수익률(%)",
+                }
+                available = [
+                    col for col in columns if col in df.columns
+                ]
+                df = df[available].rename(columns=columns)
+
+                st.dataframe(df, use_container_width=True)
+            else:
+                st.info("조회된 해외주식 보유 종목이 없어.")
+    except Exception:
+        st.error(
+            "잔고 조회에 실패했어. Secrets, 계좌번호 형식, "
+            "API 신청 권한과 요청 명세를 확인해 줘."
+        )
