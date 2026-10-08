@@ -86,6 +86,71 @@ def from_api(rows, broker):
                     "보유수량": num(x.get("cns_bse_bnc_qty")), "증권사": broker})
     return pd.DataFrame(out, columns=COLS)
 
+def _norm_name(value):
+    """종목명 비교용 정규화."""
+    import re
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+def resolve_ticker(name, code=""):
+    """Yahoo Finance 검색으로 티커 후보를 찾는다. 확신이 낮으면 빈 문자열을 반환한다."""
+    import re
+    name = str(name or "").strip()
+    code = str(code or "").strip().upper()
+
+    # API의 종목코드가 이미 미국 시장 티커처럼 보이면 먼저 검증한다.
+    if code and re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", code):
+        try:
+            hist = yf.Ticker(code).history(period="1mo", interval="1d")
+            if not hist.empty:
+                return code, "종목코드가 티커로 검증됨"
+        except Exception:
+            pass
+
+    if not name:
+        return "", "종목명이 없어 자동 검색 불가"
+    try:
+        search = yf.Search(name, max_results=10, news_count=0)
+        quotes = getattr(search, "quotes", []) or []
+    except Exception:
+        quotes = []
+
+    if not quotes:
+        return "", "Yahoo Finance 검색 결과 없음"
+
+    target = _norm_name(name)
+    candidates = []
+    for q in quotes:
+        symbol = str(q.get("symbol", "")).strip().upper()
+        qtype = str(q.get("quoteType", "")).upper()
+        label = str(q.get("longname") or q.get("shortname") or "")
+        label_norm = _norm_name(label)
+        if not symbol or (qtype and qtype not in {"EQUITY", "ETF", "MUTUALFUND"}):
+            continue
+        score = 0
+        if target and label_norm == target:
+            score = 100
+        elif target and (target in label_norm or label_norm in target):
+            score = 75
+        else:
+            # 이름이 길게 달라지는 경우에도 정확한 단어 일치 정도만 인정
+            words = [w for w in re.split(r"[^A-Z0-9]+", name.upper()) if len(w) > 2]
+            hits = sum(1 for w in words if w in label.upper())
+            score = min(60, hits * 15)
+        exchange = str(q.get("exchange", "")).upper()
+        if exchange in {"NMS", "NYQ", "NGM", "NCM", "PCX", "ASE", "NAS", "NYE"}:
+            score += 5
+        candidates.append((score, symbol, label))
+
+    candidates.sort(reverse=True)
+    if not candidates:
+        return "", "적합한 주식/ETF 검색 결과 없음"
+    # 모호한 검색 결과는 잘못된 매도 판단을 막기 위해 자동 연결하지 않는다.
+    best = candidates[0]
+    second_score = candidates[1][0] if len(candidates) > 1 else -1
+    if best[0] >= 80 and best[0] - second_score >= 10:
+        return best[1], f"자동 연결: {best[2]}"
+    return "", "검색 결과가 모호함 — 후보를 확인해 티커를 직접 선택하세요"
+
 def read_csv(upload):
     if upload is None:
         return pd.DataFrame(columns=COLS)
@@ -219,12 +284,39 @@ if portfolio.empty:
     st.info("잔고를 조회하거나 다른 증권사 CSV를 업로드해 주세요.")
     st.stop()
 
+# 자동 티커 연결 결과는 rerun 이후에도 유지한다.
+ticker_map = st.session_state.get("ticker_map", {})
+for idx, row in portfolio.iterrows():
+    map_key = f"{str(row['증권사'])}|{str(row['종목코드'])}|{str(row['종목명'])}"
+    if not str(row.get("시장 티커", "") or "").strip() and ticker_map.get(map_key):
+        portfolio.at[idx, "시장 티커"] = ticker_map[map_key]
+
 st.subheader("2. 종목 정보 확인 및 티커 연결")
-st.write("‘시장 티커’ 열을 직접 입력해 주세요. 티커가 없거나 가격 데이터 조회가 안 되면 매도/유지를 임의로 추천하지 않고 판단 보류합니다.")
+st.write("자동 티커 찾기는 Yahoo Finance에서 종목명/코드를 검색합니다. 이름이 모호하면 잘못 연결하지 않고 비워 둡니다. 가격 데이터는 Yahoo Finance에서 가져오며 완전한 실시간 시세가 아닐 수 있습니다.")
+if st.button("🔎 보유 종목 티커 자동 찾기", use_container_width=True):
+    new_map = st.session_state.get("ticker_map", {}).copy()
+    progress = st.progress(0)
+    status = st.empty()
+    total_rows = max(len(portfolio), 1)
+    for n, (idx, row) in enumerate(portfolio.iterrows(), start=1):
+        current = str(row.get("시장 티커", "") or "").strip().upper()
+        map_key = f"{str(row['증권사'])}|{str(row['종목코드'])}|{str(row['종목명'])}"
+        if current:
+            new_map[map_key] = current
+        else:
+            ticker, reason = resolve_ticker(row.get("종목명", ""), row.get("종목코드", ""))
+            if ticker:
+                new_map[map_key] = ticker
+            status.write(f"{row.get('종목명', '')}: {ticker or reason}")
+        progress.progress(n / total_rows)
+    st.session_state["ticker_map"] = new_map
+    st.success("티커 검색이 끝났습니다. 자동 연결되지 않은 종목은 아래 표에서 직접 확인해 주세요.")
+    st.rerun()
+
 edited = st.data_editor(
     portfolio, use_container_width=True, hide_index=True, num_rows="fixed",
     disabled=["종목명", "종목코드", "평가금액(원)", "손익금액(원)", "수익률(%)", "보유수량", "증권사"],
-    column_config={"시장 티커": st.column_config.TextColumn("시장 티커", help="예: QQQM, NVDA, AAPL")},
+    column_config={"시장 티커": st.column_config.TextColumn("시장 티커", help="자동 연결이 안 된 경우 예: QQQM, NVDA, AAPL")},
     key="holdings_editor"
 )
 edited["시장 티커"] = edited["시장 티커"].fillna("").astype(str).str.strip().str.upper()
