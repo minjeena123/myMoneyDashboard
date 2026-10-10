@@ -13,6 +13,7 @@
 - 각 보유 종목의 추세·모멘텀·변동성·낙폭·비중·평가손익을 반영한 종합의견과 대응 아이디어
 - 미래 데이터 참조를 줄이기 위해 신호를 1일 lag 처리한 단순 추세 백테스트
 - Mock Data 모드
+- AI 자동 분석 화면 선택 시 현재 대시보드 지표·현금 계획을 OpenAI에 전송해 분석 (API 키 필요)
 
 ## 클라우드 배포
 1. ZIP 압축을 풉니다.
@@ -29,6 +30,26 @@ python -m venv .venv
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## OpenAI 종합분석 설정 (선택)
+
+AI 자동 분석 화면은 API 키 없이도 전송 데이터 미리보기와 프롬프트 복사를 제공합니다. 실제 OpenAI 호출을 켜려면 API 플랫폼에서 API 키와 결제 설정을 준비한 뒤 키를 환경변수로 설정하고 앱을 실행합니다.
+
+```bash
+export OPENAI_API_KEY="발급받은_API_키"
+# 선택 사항: 기본 모델은 gpt-4.1-mini
+export OPENAI_MODEL="gpt-4.1-mini"
+streamlit run app.py
+```
+
+Streamlit 배포에서는 프로젝트의 `.streamlit/secrets.toml` 또는 배포 secret 설정에 다음 값을 등록할 수 있습니다. 키 파일을 저장소에 커밋하지 마세요.
+
+```toml
+OPENAI_API_KEY = "발급받은_API_키"
+OPENAI_MODEL = "gpt-4.1-mini"
+```
+
+화면 위 고지를 확인하세요. `AI 자동 분석` 화면을 선택하면 티커·추정 평가액/비중·시장 지표·현금 계획 요약이 OpenAI로 전송됩니다. 각 화면 진입은 API 사용량에 따른 비용이 발생할 수 있습니다. 같은 화면에서 입력이 재실행돼도 중복 호출하지 않으며, 재요청은 `다시 분석 요청` 버튼으로 수행합니다. ChatGPT 구독과 API 결제는 별도입니다. 요청은 `store=False`를 사용하지만 이는 OpenAI의 데이터 처리 정책이나 보존 조건을 대체하지 않으므로 민감정보를 입력하지 마세요. API 키가 없거나 호출이 실패해도 나머지 대시보드는 사용할 수 있습니다.
 
 ## 데이터 한계와 주의사항
 - Yahoo Finance 데이터는 가용성, 심볼 정책, 지연, 공급자 변경의 영향을 받습니다. 실시간 체결 데이터가 아닙니다.

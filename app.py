@@ -1,11 +1,16 @@
 from __future__ import annotations
 from datetime import date
+import hashlib
+import json
+import os
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from analytics import (compute_asset_metrics, market_regime, portfolio_risk, stress_test,
     sell_priority, cash_plan, historical_backtest, fetch_prices, macro_snapshot, stock_overall_opinion)
+from ai_analysis import (build_analysis_payload, build_analysis_prompt,
+    run_openai_analysis, safe_openai_error_summary, should_auto_request_analysis)
 
 st.set_page_config(page_title="개인 투자 의사결정 대시보드", page_icon="📈", layout="wide")
 st.markdown("""
@@ -49,8 +54,13 @@ portfolio["Ticker"]=portfolio["Ticker"].astype(str).str.strip().str.upper()
 tickers=list(dict.fromkeys([t for t in portfolio.Ticker if t]))
 market_tickers=["SPY","RSP","^GSPC","^NDX","^VIX","^TNX","^IRX","DX-Y.NYB","KRW=X","BTC-USD","IEF","HYG"]
 all_tickers=list(dict.fromkeys(tickers+market_tickers))
+
+@st.cache_data(ttl=900,show_spinner=False)
+def fetch_cached_prices(ticker_symbols,period,mock):
+    return fetch_prices(list(ticker_symbols),period=period,mock=mock)
+
 with st.spinner("시장 데이터를 불러오는 중…"):
-    prices, data_source=fetch_prices(all_tickers,period="2y",mock=(mode=="Mock demo data"))
+    prices, data_source=fetch_cached_prices(tuple(all_tickers),period="2y",mock=(mode=="Mock demo data"))
 macro=macro_snapshot(prices)
 regime=market_regime(prices)
 risk_df,total_value,fx=portfolio_risk(portfolio,prices)
@@ -58,11 +68,57 @@ asset_metrics={}
 for t in tickers:
     if t in prices and not prices[t].dropna().empty: asset_metrics[t]=compute_asset_metrics(prices[t])
 cash=cash_plan(required_cash,cash_now,confirmed_inflows,emergency_reserve,tax_buffer,target_date)
+latest_dates=[pd.Timestamp(series.dropna().index[-1]).date() for series in prices.values() if series is not None and not series.dropna().empty]
+analysis_as_of=max(latest_dates).isoformat() if latest_dates else date.today().isoformat()
+analysis_holdings=[]
+for _, risk_row in risk_df.iterrows():
+    ticker=risk_row["Ticker"]
+    holding_match=portfolio[portfolio["Ticker"]==ticker]
+    category=str(holding_match.iloc[0]["Category"]) if not holding_match.empty else "Other"
+    analysis_holdings.append({"ticker":ticker,"category":category,
+        "value_krw_estimate":risk_row["Value KRW"],"weight_pct":risk_row["Weight %"],
+        "unrealized_pnl_pct_estimate":risk_row["Unrealized P/L %"],
+        "metrics":asset_metrics.get(ticker,{})})
+analysis_payload=build_analysis_payload(
+    as_of_date=analysis_as_of,
+    data_mode=mode,
+    data_source=data_source,
+    market=regime,
+    macro=macro,
+    holdings=analysis_holdings,
+    cash_plan={key:cash.get(key) for key in ("required_liquidation","days_remaining","daily_required","monthly_plan")},
+    cash_inputs={"target_date":target_date,"target_cash_krw":required_cash,
+        "cash_available_krw":cash_now,"confirmed_inflows_krw":confirmed_inflows,
+        "emergency_reserve_krw":emergency_reserve,"tax_cost_buffer_krw":tax_buffer},
+)
+analysis_prompt=build_analysis_prompt(analysis_payload)
 
-# Persistent tab structure: each page has a distinct purpose.
-t_overview,t_market,t_stock,t_sell,t_backtest=st.tabs(["🏠 종합 대시보드","🌐 시장 분석","🔎 종목 분석","💰 매도 계획","🧪 전략 검증"])
+def configured_secret(name, default=None):
+    value=os.getenv(name)
+    if value:
+        return value
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
 
-with t_overview:
+openai_api_key=configured_secret("OPENAI_API_KEY","")
+openai_model=configured_secret("OPENAI_MODEL","gpt-4.1-mini")
+analysis_fingerprint=hashlib.sha256(analysis_prompt.encode("utf-8")).hexdigest()
+
+AI_VIEW_LABEL="🤖 AI 자동 분석"
+DASHBOARD_VIEWS=["🏠 종합 대시보드","🌐 시장 분석","🔎 종목 분석","💰 매도 계획","🧪 전략 검증",AI_VIEW_LABEL]
+
+def on_dashboard_view_change():
+    if st.session_state.get("dashboard_navigation")==AI_VIEW_LABEL:
+        st.session_state["ai_view_activation_id"]=st.session_state.get("ai_view_activation_id",0)+1
+
+st.caption("AI 자동 분석 화면을 선택하면 시장·보유 종목·현금 계획 요약이 OpenAI로 전송됩니다. API 사용료가 발생할 수 있습니다.")
+selected_view=st.segmented_control("대시보드 화면",DASHBOARD_VIEWS,selection_mode="single",
+    default=DASHBOARD_VIEWS[0],width="stretch",label_visibility="collapsed",
+    key="dashboard_navigation",on_change=on_dashboard_view_change)
+
+if selected_view=="🏠 종합 대시보드":
     st.subheader("오늘의 의사결정 요약")
     if data_source.startswith("MOCK"):
         st.warning("데모 데이터입니다. 아래 수치와 신호는 실제 시장 판단에 사용하지 마세요.")
@@ -88,7 +144,7 @@ with t_overview:
         st.dataframe(risk_df.sort_values("Weight %",ascending=False)[["Ticker","Value KRW","Weight %","Unrealized P/L %","52W DD %","Vol 20d %"]].style.format({"Value KRW":"₩{:,.0f}","Weight %":"{:.1f}%","Unrealized P/L %":"{:+.1f}%","52W DD %":"{:.1f}%","Vol 20d %":"{:.1f}%"}),use_container_width=True,hide_index=True)
     st.caption("점수와 종목 의견은 규칙 기반 참고치이며, 검증된 예측 모델이나 매수·매도 지시가 아닙니다.")
 
-with t_market:
+if selected_view=="🌐 시장 분석":
     st.subheader("시장 환경")
     snap=[("^GSPC","S&P 500"),("^NDX","NASDAQ 100"),("^VIX","VIX"),("^TNX","미국 10년물 금리"),("DX-Y.NYB","달러지수 DXY"),("KRW=X","USD/KRW")]
     cols=st.columns(3)
@@ -112,7 +168,7 @@ with t_market:
     macro_rows=[{"지표":k,"최근 값":v.get("latest"),"1개월 변화":v.get("change_1m"),"3개월 변화":v.get("change_3m"),"상태":v.get("status"),"출처·제한":v.get("source")} for k,v in macro.items()]
     st.dataframe(pd.DataFrame(macro_rows),use_container_width=True,hide_index=True)
 
-with t_stock:
+if selected_view=="🔎 종목 분석":
     st.subheader("종목별 기술적 분석")
     valid=[t for t in tickers if t in prices and not prices[t].dropna().empty]
     if not valid: st.warning("분석 가능한 가격 데이터가 없습니다.")
@@ -141,7 +197,7 @@ with t_stock:
         a,b,c=st.columns(3); a.metric("가정 매도 수량",f"{shares*fraction/100:.4f}주"); b.metric("평가액 기준 현금화",f"₩{value*fraction/100:,.0f}"); c.metric("잔여 평가액",f"₩{value*(1-fraction/100):,.0f}")
         st.caption("세금·수수료·환전 스프레드 미반영. 지표 하나만으로 매도 여부를 결정하지 마세요.")
 
-with t_sell:
+if selected_view=="💰 매도 계획":
     st.subheader("현금 확보 계획")
     st.caption("계산식: 목표 현금 + 비상금 + 세금·비용 버퍼 − 현재 가용 현금 − 확정 유입액. 비상금·버퍼는 별도 추가로 계산됩니다.")
     c=st.columns(4); c[0].metric("필요 현금 목표",f"₩{required_cash:,.0f}"); c[1].metric("추가 현금화 필요액",f"₩{cash['required_liquidation']:,.0f}"); c[2].metric("남은 날짜",f"{cash['days_remaining']}일"); c[3].metric("하루 평균 확보 필요액",f"₩{cash['daily_required']:,.0f}")
@@ -167,7 +223,7 @@ with t_sell:
         st.metric("가정 시나리오 평가액 변화",f"₩{stres['change_krw']:,.0f}",delta=f"{stres['change_pct']:+.1f}%")
         st.caption("단순 충격 가정이며 예측값이 아닙니다. USD/KRW 효과도 근사치입니다.")
 
-with t_backtest:
+if selected_view=="🧪 전략 검증":
     st.subheader("전략 검증")
     valid=[t for t in tickers if t in prices and len(prices[t].dropna())>250]
     if not valid: st.info("백테스트에는 충분한 일별 가격 데이터가 필요합니다.")
@@ -186,6 +242,48 @@ with t_backtest:
     st.write("- 스윙 구조는 최근 국지적 고점·저점의 단순 규칙 기반 근사치입니다.")
     st.write("- 실제 S&P 구성종목 breadth, 실질금리, 신용스프레드는 미연결이면 데이터 없음으로 표시합니다.")
     st.write("- 매도 우선순위는 설명 가능한 휴리스틱이며 최적화된 매도 알고리즘이 아닙니다.")
+
+if selected_view==AI_VIEW_LABEL:
+    st.subheader("OpenAI 종합분석")
+    st.caption("화면을 선택할 때마다 현재 요약 데이터로 분석을 요청합니다. 결과는 읽기 전용이며 보유 내역이나 매도 계획은 변경하지 않습니다.")
+    if analysis_payload["metadata"]["mock_data_warning"]:
+        st.warning("현재 데모 데이터입니다. AI 응답도 실제 투자 판단에 사용하지 마세요.")
+    if not openai_api_key:
+        st.info("API 키가 설정되지 않아 자동 분석 요청을 건너뜁니다. 아래 프롬프트 복사는 사용할 수 있습니다.")
+    else:
+        st.caption("API 모델: {} · 사용량에 따라 OpenAI API 비용이 발생할 수 있습니다.".format(openai_model))
+    with st.expander("전송될 데이터 미리보기",expanded=True):
+        st.json(analysis_payload)
+    with st.expander("분석 프롬프트 확인 및 복사"):
+        st.code(analysis_prompt,language=None)
+    activation_id=st.session_state.get("ai_view_activation_id",0)
+    retry_request=st.button("다시 분석 요청",disabled=not bool(openai_api_key),key="retry_openai_analysis")
+    if retry_request:
+        activation_id+=1
+        st.session_state["ai_view_activation_id"]=activation_id
+    processed_activation_id=st.session_state.get("ai_view_processed_activation_id",0)
+    should_request=should_auto_request_analysis(selected_view,AI_VIEW_LABEL,activation_id,processed_activation_id)
+    if should_request:
+        st.session_state["ai_view_processed_activation_id"]=activation_id
+        if not openai_api_key:
+            st.info("API 키를 설정한 뒤 다른 화면으로 이동했다가 이 화면을 다시 선택하면 자동 요청됩니다.")
+        else:
+            st.session_state.pop("openai_analysis_result",None)
+            try:
+                with st.spinner("OpenAI가 요약 데이터를 분석하고 있습니다…"):
+                    analysis_result=run_openai_analysis(analysis_payload,openai_api_key,openai_model)
+                st.session_state["openai_analysis_result"]={"fingerprint":analysis_fingerprint,"text":analysis_result}
+            except Exception as error:
+                st.error("OpenAI 분석 실패: {} 오류 원문과 키는 표시하지 않았습니다.".format(
+                    safe_openai_error_summary(error)))
+    saved_analysis=st.session_state.get("openai_analysis_result")
+    if saved_analysis:
+        if saved_analysis.get("fingerprint")==analysis_fingerprint:
+            st.subheader("AI 분석 결과 · 읽기 전용")
+            st.markdown(saved_analysis["text"])
+        else:
+            st.info("분석 입력이 변경되어 이전 응답을 숨겼습니다. 이 화면을 다시 선택하면 새 분석을 요청합니다.")
+    st.caption("AI 결과는 투자 조언이나 수익 보장이 아닙니다. 주문 기능은 없으며 최종 결정은 사용자에게 있습니다.")
 
 st.divider()
 st.caption("개인용 프로토타입 · 투자 조언 또는 수익 보장 아님 · 데이터 지연·누락 가능 · 세금은 증권사/세무 전문가 확인 필요")
